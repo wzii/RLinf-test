@@ -1,0 +1,2 @@
+tests/parity/goldens/*.pt filter=lfs diff=lfs merge=lfs -text
+tests/parity/sample_dataset/*.npy filter=lfs diff=lfs merge=lfs -text

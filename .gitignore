@@ -6,6 +6,7 @@ __pycache__
 *.txt
 !requirements/**
 !docs/*
+!tests/parity/sample_dataset/**
 *.DS_Store
 *.out
 build
@@ -16,6 +17,9 @@ outputs/*
 *.so
 .venv
 .docs-venv
+# Repo-local venvs used by the parity tests (heavy, do not commit).
+openvlaoft_libero_venv/
+openvlaoft_wan_venv/
 uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
