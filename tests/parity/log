@@ -1,0 +1,21 @@
+  Pushed: wzii/RLinf-test branch parity-tests (commit 11ed83d)
+  - Test code: tests/parity/*.py, *.md, run_all.sh
+  - 4 GPU goldens (.pt) → Git LFS (~706 MB)
+  - 32 sample .npy files for reproduction → Git LFS (~151 MB)
+  - 36 LFS objects, ~895 MB total LFS uploaded
+  
+  Did not modify any venv — only created new files under tests/parity/, so no patch needed. The two heavy venvs (openvlaoft_libero_venv/,
+  openvlaoft_wan_venv/) are now in .gitignore.
+
+  Browse:
+  - Tree: https://github.com/wzii/RLinf-test/tree/parity-tests
+  - New PR: https://github.com/wzii/RLinf-test/pull/new/parity-tests
+
+  On NPU host the workflow is just:
+  git clone -b parity-tests git@github.com:wzii/RLinf-test.git RLinf
+  cd RLinf && git lfs pull           # fetches goldens + sample_dataset
+  bash tests/parity/run_all.sh       # generates *_npu.pt
+  # then diff with tests/parity/compare.py per HANDOFF.md
+  
+  The sample_dataset is in-repo, so tests/parity/run_all.sh works out of the box without needing the full Wan checkpoint dataset folder (only the
+  model .safetensors + VAE + reward model still need to be present locally, paths are overridable via env vars in common.py).
