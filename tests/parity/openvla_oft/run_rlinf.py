@@ -60,6 +60,7 @@ from common import (  # noqa: E402
     compare_tensors,
     device_label,
     format_diff_table,
+    install_fp32_attention,
     pick_device,
     print_env_banner,
     per_sample_summary,
@@ -150,11 +151,16 @@ def main() -> int:
     ap.add_argument("--num-samples", type=int, default=NUM_SAMPLES)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--repeats", type=int, default=2, help="self-consistency runs")
+    ap.add_argument("--fp32-attention", action="store_true",
+                    help="Replace F.scaled_dot_product_attention with a manual fp32 "
+                         "implementation to eliminate Ascend-vs-NVIDIA kernel divergence. "
+                         "Apply on BOTH devices to get cross-hardware comparable goldens.")
     args = ap.parse_args()
 
     set_determinism()
     device = pick_device()
-    print_env_banner(device, {"impl": "rlinf", "ckpt": str(args.model_path)})
+    impl_tag = "rlinf-fp32attn" if args.fp32_attention else "rlinf"
+    print_env_banner(device, {"impl": impl_tag, "ckpt": str(args.model_path)})
 
     # Lazy import so the parity dir can be imported on machines without HF.
     from rlinf.models.embodiment.openvla_oft.rlinf import get_model
@@ -166,6 +172,9 @@ def main() -> int:
     model = model.to(device)
     model.eval()
     print(f"[parity] model loaded in {time.time() - t0:.1f}s")
+
+    if args.fp32_attention:
+        install_fp32_attention(model)
 
     inputs = collect_libero_image_inputs(n=args.num_samples)
     print(f"[parity] inputs fingerprint = {inputs['fingerprint']}")
@@ -214,9 +223,9 @@ def main() -> int:
         ],
     }
 
-    out_path = args.out or (
-        GOLDENS_DIR / f"openvla_oft_rlinf_{device_label(device)}.pt"
-    )
+    dev = device_label(device)
+    suffix = "_fp32attn" if args.fp32_attention else ""
+    out_path = args.out or (GOLDENS_DIR / f"openvla_oft_rlinf{suffix}_{dev}.pt")
     save_golden(payload, out_path)
     print(f"[parity] wrote {out_path}")
     for k, h in payload["tensor_hashes"].items():

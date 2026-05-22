@@ -58,6 +58,114 @@ GOLDENS_DIR = REPO_ROOT / "tests" / "parity" / "goldens"
 
 
 # ---------------------------------------------------------------------------
+# fp32 attention patch
+# ---------------------------------------------------------------------------
+
+
+def install_fp32_attention(model) -> None:
+    """Patch every LlamaSdpaAttention in the model to compute attention in fp32.
+
+    Root cause: LlamaSdpaAttention calls F.scaled_dot_product_attention, which
+    dispatches to the device FA kernel (cuDNN Flash on NVIDIA, aclnn_fa on
+    Ascend). The two kernels accumulate bfloat16 matmuls in a different order,
+    producing ~0.1-0.5 relL2 attention output divergence that cascades through
+    all subsequent LLM layers.
+
+    This patch replaces the SDPA call with a manual fp32 implementation:
+      q/k/v cast to float32 → q@k^T*scale → +mask → softmax → @v → cast back
+    All surrounding logic (QKV proj, RoPE, KV-cache, model-specific padding mask
+    transformation, repeat_kv, o_proj) is preserved exactly as in the original.
+
+    Overhead: ~15-20 % extra memory for the attention fp32 tensors; no change
+    to parameter storage or QKV/o_proj arithmetic.
+    """
+    import math as _math
+    import torch.nn.functional as _F
+
+    try:
+        from transformers.models.llama.modeling_llama import (
+            LlamaSdpaAttention,
+            apply_rotary_pos_emb,
+            repeat_kv,
+        )
+    except ImportError:
+        print("[parity][WARN] install_fp32_attention: LlamaSdpaAttention not found, skipping")
+        return
+
+    def _fp32_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position=None,
+        **kwargs,
+    ):
+        if output_attentions:
+            return super(LlamaSdpaAttention, self).forward(
+                hidden_states=hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_value=past_key_value,
+                output_attentions=output_attentions, use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states   = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads,           self.head_dim).transpose(1, 2)
+        key_states   = key_states  .view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        _pkv = getattr(self, "past_key_value", past_key_value)
+        if _pkv is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = _pkv.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states   = repeat_kv(key_states,   self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Preserve the model-specific padding-mask transformation: convert the
+        # HuggingFace causal mask into a per-pad-token column mask by taking the
+        # last row and broadcasting it (see the comment in the original forward).
+        causal_mask = attention_mask
+        if causal_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+            D = causal_mask.shape[-1]
+            last_row = causal_mask[:, :, -1, :].clone()
+            causal_mask = last_row.unsqueeze(2).expand(-1, -1, D, -1)
+
+        # Manual fp32 attention (replaces F.scaled_dot_product_attention).
+        q = query_states.float()
+        k = key_states.float()
+        v = value_states.float()
+        scale = 1.0 / _math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if causal_mask is not None:
+            attn_weights = attn_weights + causal_mask.float()
+        attn_weights = _F.softmax(attn_weights, dim=-1)
+        if self.training and self.attention_dropout > 0.0:
+            attn_weights = _F.dropout(attn_weights, p=self.attention_dropout)
+        attn_output = torch.matmul(attn_weights, v).to(query_states.dtype)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
+
+    LlamaSdpaAttention.forward = _fp32_forward
+    n = sum(1 for m in model.modules() if type(m).__name__ == "LlamaSdpaAttention")
+    print(f"[parity] install_fp32_attention: patched {n} LlamaSdpaAttention modules")
+
+
+# ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
 
