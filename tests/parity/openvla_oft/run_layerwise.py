@@ -126,11 +126,40 @@ def main() -> int:
                     help="batch elements stored as FULL tensors for boundary layers")
     ap.add_argument("--repeats", type=int, default=2, help="self-consistency runs")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--inject-projector-from", type=Path, default=None, metavar="LAYERS_GOLDEN",
+        help="If set, replace model.projector output with the full_out tensor from "
+             "this layerwise golden (e.g. openvla_oft_layers_gpu.pt). This isolates "
+             "LLM-only divergence: the LLM sees GPU-quality vision features on the "
+             "current device. --num-samples is forced to the injection tensor's batch "
+             "size (typically 4).",
+    )
     args = ap.parse_args()
 
     set_determinism()
     device = pick_device()
-    print_env_banner(device, {"impl": "rlinf-layerwise", "ckpt": str(args.model_path)})
+
+    # ── Optional projector injection setup ────────────────────────────────────
+    inject_tensor = None
+    if args.inject_projector_from is not None:
+        src = torch.load(args.inject_projector_from, map_location="cpu", weights_only=False)
+        proj_rec = src.get("records", {}).get("projector")
+        if proj_rec is None or "full_out" not in proj_rec:
+            raise KeyError(
+                f"{args.inject_projector_from} has no records['projector']['full_out']. "
+                "Re-run run_layerwise.py to regenerate."
+            )
+        inject_tensor = proj_rec["full_out"]           # fp32, CPU, [n, 256, 4096]
+        n_inj = inject_tensor.shape[0]
+        if args.num_samples != n_inj:
+            print(f"[parity] --inject-projector-from: forcing --num-samples {n_inj} "
+                  f"(injection tensor batch size)")
+            args.num_samples = n_inj
+        print(f"[parity] projector injection enabled from {args.inject_projector_from.name}, "
+              f"shape={tuple(inject_tensor.shape)}")
+
+    impl_tag = "rlinf-layerwise-inject" if inject_tensor is not None else "rlinf-layerwise"
+    print_env_banner(device, {"impl": impl_tag, "ckpt": str(args.model_path)})
 
     from rlinf.models.embodiment.openvla_oft.rlinf import get_model
 
@@ -151,6 +180,12 @@ def main() -> int:
         print(f"           {n}")
 
     nf = args.full_samples
+
+    # Move injection tensor to device once if needed.
+    if inject_tensor is not None:
+        inject_on_device = inject_tensor.to(device=device, dtype=torch.bfloat16)
+    else:
+        inject_on_device = None
 
     def run_once() -> dict:
         records: dict[str, dict] = {}
@@ -182,6 +217,16 @@ def main() -> int:
 
         for name, mod in named.items():
             handles.append(mod.register_forward_hook(make_hook(name)))
+
+        # Projector injection: replace projector output with GPU tensor so the
+        # LLM sees GPU-quality vision features. Registered AFTER the normal hook
+        # so the normal hook still fingerprints the ORIGINAL NPU projector output
+        # for reference; the injected tensor is what the downstream LLM receives.
+        if inject_on_device is not None:
+            def _inject(module, inp, out):
+                return inject_on_device
+            handles.append(model.projector.register_forward_hook(_inject))
+
         try:
             with torch.no_grad():
                 actions, result = model.predict_action_batch(
@@ -216,17 +261,23 @@ def main() -> int:
             print("\n[parity] self-consistency OK: all module fingerprints "
                   "bit-exact across repeats.")
 
+    dev = device_label(device)
+    injected = args.inject_projector_from is not None
     payload = {
         "schema": "openvla_oft_layers_v1",
-        "device_label": device_label(device),
+        "device_label": dev,
         "device": str(device),
         "num_samples": args.num_samples,
         "full_samples": nf,
         "input_fingerprint": inputs["fingerprint"],
         "boundary_layers": sorted(boundary),
+        "projector_injected": injected,
+        "projector_inject_source": str(args.inject_projector_from) if injected else None,
         "records": runs[0],
     }
-    out_path = args.out or (GOLDENS_DIR / f"openvla_oft_layers_{device_label(device)}.pt")
+    default_name = (f"openvla_oft_layers_{dev}_inject.pt" if injected
+                    else f"openvla_oft_layers_{dev}.pt")
+    out_path = args.out or (GOLDENS_DIR / default_name)
     save_golden(payload, out_path)
     n_full = sum(1 for r in runs[0].values() if "full_out" in r)
     print(f"[parity] wrote {out_path}  ({len(runs[0])} modules, {n_full} with full tensors)")
