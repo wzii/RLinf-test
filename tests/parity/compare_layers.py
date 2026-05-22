@@ -68,9 +68,11 @@ def main() -> int:
     args = ap.parse_args()
 
     A, B = load(args.a), load(args.b)
-    if A.get("schema") != "openvla_oft_layers_v1" or B.get("schema") != A.get("schema"):
+    if A.get("schema") != B.get("schema"):
         print(f"[compare] schema mismatch: {A.get('schema')} vs {B.get('schema')}", file=sys.stderr)
         return 3
+    if not A.get("schema", "").endswith("_layers_v1"):
+        print(f"[compare][WARN] unexpected schema '{A.get('schema')}' — expected *_layers_v1", file=sys.stderr)
     if A.get("input_fingerprint") != B.get("input_fingerprint"):
         print("[compare][WARN] input fingerprints differ — inputs diverged, "
               "layer diffs below are NOT attributable to kernels.", file=sys.stderr)

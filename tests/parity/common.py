@@ -83,6 +83,18 @@ def set_determinism(seed: int = SEED) -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
     except Exception:
         pass
+    # Seed NPU RNG (Ascend/torch_npu). Without this, torch.npu ops that draw
+    # from the device RNG (e.g. attention softmax internal stochastic rounding)
+    # give different results across calls even in eval() mode.
+    try:
+        import torch_npu  # noqa: F401
+        if torch.npu.is_available():
+            torch.npu.manual_seed_all(seed)
+    except Exception:
+        pass
+    # Ascend CANN determinism flag: prevents the FA kernel from using
+    # non-deterministic atomics. No-op on non-Ascend hosts.
+    os.environ.setdefault("ACLNN_DETERMINISTIC", "1")
 
 
 def pick_device() -> torch.device:
@@ -206,6 +218,64 @@ def install_microbatch(pipe, micro_batch: int) -> None:
         return out
 
     cls.__call__ = _chunked_call
+
+
+# ---------------------------------------------------------------------------
+# Layer fingerprinting (shared by openvla_oft and wan layerwise scripts)
+# ---------------------------------------------------------------------------
+
+
+def _first_tensor(x) -> "torch.Tensor | None":
+    """Return the first torch.Tensor found in a (possibly nested) structure."""
+    if torch.is_tensor(x):
+        return x
+    if isinstance(x, (list, tuple)):
+        for e in x:
+            t = _first_tensor(e)
+            if t is not None:
+                return t
+    if isinstance(x, dict):
+        for e in x.values():
+            t = _first_tensor(e)
+            if t is not None:
+                return t
+    return None
+
+
+def layer_fingerprint(t: torch.Tensor) -> dict:
+    """Cheap, device-independent summary of a tensor.
+
+    Computes reductions ON the tensor's own device (no CPU copy of the full
+    activation). Only a 5-value vector crosses to CPU, so fingerprinting all
+    ~1500 modules of a large VLA takes ~6s instead of 17+ minutes.
+
+    The order-sensitive checksum (dot against a linspace ramp) flags any
+    single-element change or permutation, so equal chk => bit-identical layout.
+    """
+    orig_dtype = str(t.dtype)
+    d = t.detach().reshape(-1)
+    n = d.numel()
+    if n == 0:
+        return {"shape": tuple(t.shape), "dtype": orig_dtype,
+                "mean": 0.0, "std": 0.0, "absmax": 0.0, "l2": 0.0, "chk": 0.0}
+    f = d.float()
+    chk = torch.dot(f, torch.linspace(1.0, 2.0, n, device=f.device, dtype=torch.float32))
+    vec = torch.stack([
+        f.mean(),
+        f.std() if n > 1 else f.new_zeros(()),
+        f.abs().max(),
+        f.norm(),
+        chk,
+    ]).double().cpu()
+    return {
+        "shape": tuple(t.shape),
+        "dtype": orig_dtype,
+        "mean": vec[0].item(),
+        "std": vec[1].item(),
+        "absmax": vec[2].item(),
+        "l2": vec[3].item(),
+        "chk": vec[4].item(),
+    }
 
 
 # ---------------------------------------------------------------------------

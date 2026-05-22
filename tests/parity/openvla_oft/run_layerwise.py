@@ -49,71 +49,16 @@ from common import (  # noqa: E402
     GOLDENS_DIR,
     NUM_SAMPLES,
     OPENVLA_OFT_CKPT_DIR,
+    _first_tensor,
     collect_libero_image_inputs,
     device_label,
+    layer_fingerprint as fingerprint,
     pick_device,
     print_env_banner,
     save_golden,
     set_determinism,
 )
 from run_rlinf import build_cfg, build_env_obs  # noqa: E402
-
-
-def _first_tensor(x):
-    """Return the first torch.Tensor found in a (possibly nested) structure."""
-    if torch.is_tensor(x):
-        return x
-    if isinstance(x, (list, tuple)):
-        for e in x:
-            t = _first_tensor(e)
-            if t is not None:
-                return t
-    if isinstance(x, dict):
-        for e in x.values():
-            t = _first_tensor(e)
-            if t is not None:
-                return t
-    return None
-
-
-def fingerprint(t: torch.Tensor) -> dict:
-    """Cheap, device-independent summary of a tensor.
-
-    Computed with reductions ON the tensor's own device (no CPU copy of the
-    activation -- copying every layer's hidden state to CPU to hash it is what
-    made the first version unusably slow). The four scalars (mean / std /
-    abs-max / L2) plus a device-side order-sensitive checksum are enough to (a)
-    measure the magnitude of any GPU<->NPU disagreement and (b) flag exact
-    equality across same-device repeats. Only a 5-value vector crosses to CPU.
-    """
-    orig_dtype = str(t.dtype)
-    d = t.detach().reshape(-1)
-    n = d.numel()
-    if n == 0:
-        return {"shape": tuple(t.shape), "dtype": orig_dtype,
-                "mean": 0.0, "std": 0.0, "absmax": 0.0, "l2": 0.0, "chk": 0.0}
-    f = d.float()
-    # Order-sensitive checksum: dot the flattened signal against a deterministic
-    # ramp so a permutation or any single-element change moves the value (a plain
-    # sum would not). The ramp is the same shape on both devices, so equal chk =>
-    # bit-identical layout. Cheap GPU reduction, no host copy of the activation.
-    chk = torch.dot(f, torch.linspace(1.0, 2.0, n, device=f.device, dtype=torch.float32))
-    vec = torch.stack([
-        f.mean(),
-        f.std() if n > 1 else f.new_zeros(()),
-        f.abs().max(),
-        f.norm(),
-        chk,
-    ]).double().cpu()
-    return {
-        "shape": tuple(t.shape),
-        "dtype": orig_dtype,
-        "mean": vec[0].item(),
-        "std": vec[1].item(),
-        "absmax": vec[2].item(),
-        "l2": vec[3].item(),
-        "chk": vec[4].item(),
-    }
 
 
 def select_boundary_names(named: dict[str, torch.nn.Module]) -> list[str]:
