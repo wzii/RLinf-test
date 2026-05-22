@@ -37,11 +37,14 @@ from common import (  # noqa: E402
     GOLDENS_DIR,
     NUM_SAMPLES,
     WAN_CKPT_DIR,
+    WAN_MICRO_BATCH,
     array_hash,
     collect_wan_inputs,
     compare_tensors,
     device_label,
     format_diff_table,
+    install_fixed_noise,
+    install_microbatch,
     per_sample_summary,
     pick_device,
     print_env_banner,
@@ -140,6 +143,15 @@ def main() -> int:
     t0 = time.time()
     pipe = build_pipeline(args.ckpt_dir, device)
     print(f"[parity] pipeline built in {time.time() - t0:.1f}s")
+
+    # Pin the diffusion noise to a byte-identical artifact across x86/aarch64.
+    # See common.install_fixed_noise: CPU torch.randn is NOT portable across
+    # architectures, so generating it per-machine would silently desync inputs.
+    install_fixed_noise(pipe)
+    # Split each forward into small chunks so the NPU host's peak memory stays
+    # low without reducing the number of samples covered.
+    install_microbatch(pipe, WAN_MICRO_BATCH)
+    print(f"[parity] wan micro-batch = {WAN_MICRO_BATCH} (total {args.num_samples})")
 
     inputs = collect_wan_inputs(n=args.num_samples)
     print(f"[parity] inputs fingerprint = {inputs['fingerprint']}")

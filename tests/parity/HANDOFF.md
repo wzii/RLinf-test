@@ -9,6 +9,7 @@ to your NPU host, then run the same scripts there and diff.
 | --- | --- | --- | --- |
 | Test scripts | `RLinf/tests/parity/` (the whole dir) | ~30 KB | Everything except the goldens. |
 | GPU goldens | `RLinf/tests/parity/goldens/*.pt` | ~705 MB total | One per (model × impl). |
+| Fixed Wan noise | `RLinf/tests/parity/goldens/wan_fixed_noise.pt` | small | **Must transfer.** The byte-identical diffusion noise; NPU runs load it instead of regenerating (CPU `torch.randn` is not portable x86↔aarch64). |
 | OpenVLA-OFT checkpoint | `/workspace/Openvla-oft-SFT-libero-spatial-traj1/` | ~28 GB | Skip if the NPU host already has it. |
 | Wan checkpoint + dataset | `/workspace/RLinf-Wan-LIBERO-Spatial/` | ~10 GB | Skip if already on NPU. |
 
@@ -85,9 +86,13 @@ diff against the NPU run is real hardware/kernel drift, not flakiness.
 ## Sanity reminders
 
 - The scripts pin determinism (`torch.use_deterministic_algorithms`, cudnn
-  deterministic, `do_sample=False` for OFT, `seed=0` `rand_device="cpu"` for
-  Wan). On GPU each script's two repeats agree bit-exactly — your NPU runs
-  must also pass self-consistency before cross-device diffs mean anything.
+  deterministic, `do_sample=False` for OFT). For Wan the noise is pinned to the
+  shipped `wan_fixed_noise.pt` artifact (NOT `rand_device="cpu"`, which is not
+  portable across x86/aarch64). On GPU each script's two repeats agree
+  bit-exactly — your NPU runs must also pass self-consistency before cross-device
+  diffs mean anything. The per-forward batch is `WAN_MICRO_BATCH` (env
+  `PARITY_WAN_MICRO_BATCH`, default 4); total samples stay `PARITY_NUM_SAMPLES`
+  (default 32).
 - Inputs are sourced from `RLinf-Wan-LIBERO-Spatial/dataset/`. The fingerprint
   is printed at the top of every run; if it doesn't match between GPU and NPU
   the inputs themselves diverged and the comparison is invalid.

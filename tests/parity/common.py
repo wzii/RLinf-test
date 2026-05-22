@@ -27,7 +27,15 @@ from typing import Any
 import numpy as np
 import torch
 
-NUM_SAMPLES = 32
+# Total number of parity samples (test coverage). This is NOT the per-forward
+# batch -- see WAN_MICRO_BATCH below, which splits each Wan forward into smaller
+# chunks so the NPU host's peak memory stays low without dropping coverage.
+NUM_SAMPLES = int(os.environ.get("PARITY_NUM_SAMPLES", "32"))
+# Per-forward micro-batch for the Wan pipeline. The total NUM_SAMPLES samples are
+# processed WAN_MICRO_BATCH at a time and the results concatenated, so the golden
+# is identical in coverage to a single big batch but each forward only holds a
+# few samples in memory. Set <=0 to disable (one forward over everything).
+WAN_MICRO_BATCH = int(os.environ.get("PARITY_WAN_MICRO_BATCH", "4"))
 SEED = 1234
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -97,6 +105,107 @@ def device_label(device: torch.device) -> str:
     if kind == "cuda":
         return "gpu"
     return kind
+
+
+# ---------------------------------------------------------------------------
+# Cross-architecture fixed noise
+# ---------------------------------------------------------------------------
+
+# Wan's ``BasePipeline.generate_noise`` draws ``torch.randn`` through a CPU
+# generator on the theory that "CPU => hardware-independent". That is only half
+# true: the MT19937 integer stream IS portable, but ``torch.randn``'s Box-Muller
+# transform uses transcendental ops (log/cos/sqrt) whose libm / vectorised
+# (sleef) results differ by 1-2 ULP between x86 (the GPU host) and aarch64 (the
+# NPU host). The fp32->bf16 cast washes out most -- but not all -- of that, which
+# is enough to break the "inputs are byte-identical" premise the whole parity
+# test rests on. So we generate the noise ONCE (fp32, CPU, seeded), persist it to
+# goldens/, and load the exact same bytes on every machine. fp32 tensors are
+# byte-portable across x86/aarch64 (both little-endian IEEE-754), so the noise
+# is now a fixed input artifact just like the dataset frames.
+WAN_FIXED_NOISE_PATH = GOLDENS_DIR / "wan_fixed_noise.pt"
+
+
+def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
+    """Monkeypatch ``pipe.generate_noise`` to return byte-identical noise across
+    architectures.
+
+    First machine to run generates and saves the noise; every later run --
+    crucially the NPU run -- loads the same bytes. Keyed by ``(seed, shape)`` so
+    multiple configs in one process each get their own stable noise. Transfer
+    ``goldens/wan_fixed_noise.pt`` to the NPU host alongside the goldens.
+    """
+    cache: dict[tuple, torch.Tensor] = {}
+    if path.exists():
+        cache = torch.load(path, map_location="cpu")
+        print(f"[parity] fixed noise: loaded {len(cache)} tensor(s) from {path}")
+
+    def _generate_noise(shape, seed=None, rand_device="cpu",
+                        rand_torch_dtype=torch.float32, device=None,
+                        torch_dtype=None, **_):
+        key = (seed, tuple(shape))
+        if key not in cache:
+            gen = torch.Generator("cpu")
+            if seed is not None:
+                gen.manual_seed(seed)
+            cache[key] = torch.randn(tuple(shape), generator=gen,
+                                     device="cpu", dtype=torch.float32)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(cache, path)
+            print(f"[parity] fixed noise: generated + saved {key} -> {path}")
+        else:
+            print(f"[parity] fixed noise: reused {key}")
+        noise = cache[key]
+        return noise.to(dtype=torch_dtype or pipe.torch_dtype,
+                        device=device or pipe.device)
+
+    pipe.generate_noise = _generate_noise
+
+
+def install_microbatch(pipe, micro_batch: int) -> None:
+    """Split each ``pipe(**kwargs)`` forward into ``micro_batch``-sized chunks.
+
+    The total batch is processed a few samples at a time and the per-env outputs
+    concatenated, so the golden covers the same samples as a single big batch but
+    the NPU only ever holds ``micro_batch`` Wan forwards in memory at once.
+
+    ``pipe(**kwargs)`` resolves ``__call__`` on the *type*, not the instance, so
+    we wrap the class method (fine for a test process). Both Wan parity entry
+    points call the pipeline with the same batched kwargs: ``input_image`` (list
+    of length B), ``input_image4`` (B x list), ``action`` (tensor [B, ...]),
+    ``batch_size`` (B); the return is an env-major list of length B.
+
+    Note: with the fixed-noise patch keyed by (seed, shape), equal-sized chunks
+    share the same noise tensor. That is fine for a kernel-parity test -- the
+    conditioning differs per env and both devices run the identical split -- but
+    it means the golden is not bit-comparable to an un-chunked single-batch run.
+    """
+    if micro_batch is None or micro_batch <= 0:
+        return
+    cls = type(pipe)
+    orig_call = cls.__call__
+
+    def _chunked_call(self, *args, input_image=None, input_image4=None,
+                      action=None, batch_size=None, **kwargs):
+        # Fall through unless this is the batched shape both parity scripts use.
+        if (args or not isinstance(input_image, list) or action is None
+                or batch_size is None or batch_size <= micro_batch):
+            return orig_call(self, *args, input_image=input_image,
+                             input_image4=input_image4, action=action,
+                             batch_size=batch_size, **kwargs)
+        out: list = []
+        for s in range(0, batch_size, micro_batch):
+            e = min(s + micro_batch, batch_size)
+            out.extend(orig_call(
+                self,
+                input_image=input_image[s:e],
+                input_image4=input_image4[s:e] if input_image4 is not None else None,
+                action=action[s:e],
+                batch_size=e - s,
+                **kwargs,
+            ))
+        return out
+
+    cls.__call__ = _chunked_call
 
 
 # ---------------------------------------------------------------------------

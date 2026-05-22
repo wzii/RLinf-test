@@ -22,10 +22,15 @@ between GPU and NPU.
 Determinism notes
 -----------------
 WanVideoPipeline samples noise via ``torch.randn(..., generator=Generator("cpu").manual_seed(seed))``
-in ``BasePipeline.generate_noise``, so the initial noise is hardware-
-independent. The pipeline's DDIM / EulerDiscrete sampler is deterministic
-given the inputs. The remaining drift sources are convolution / attention
-kernels — exactly what we are trying to characterise here.
+in ``BasePipeline.generate_noise``. This is NOT actually hardware-independent:
+``torch.randn``'s Box-Muller transform uses transcendental ops whose libm /
+SIMD results differ by 1-2 ULP between x86 (GPU host) and aarch64 (NPU host),
+so the noise would silently desync the two runs. We therefore replace it with
+``common.install_fixed_noise``: the noise is generated once, persisted under
+goldens/, and the same bytes are loaded on every machine. The pipeline's
+DDIM / EulerDiscrete sampler is then deterministic given the inputs, so the
+remaining drift sources are convolution / attention kernels — exactly what we
+are trying to characterise here.
 
 How to use across hardware
 --------------------------
@@ -59,10 +64,13 @@ from common import (  # noqa: E402
     NUM_SAMPLES,
     WAN_CKPT_DIR,
     WAN_DATASET_DIR,
+    WAN_MICRO_BATCH,
     array_hash,
     compare_tensors,
     device_label,
     format_diff_table,
+    install_fixed_noise,
+    install_microbatch,
     per_sample_summary,
     pick_device,
     print_env_banner,
@@ -141,6 +149,14 @@ def main() -> int:
     t0 = time.time()
     env = WanEnv(cfg, cfg.total_num_envs, seed_offset=0, total_num_processes=1)
     print(f"[parity] env built in {time.time() - t0:.1f}s")
+
+    # Pin the diffusion noise to a byte-identical artifact across x86/aarch64
+    # (CPU torch.randn is NOT portable across architectures) and split each Wan
+    # forward into small chunks so the NPU's peak memory stays low. Both act on
+    # the pipeline the env built (env.pipe) so the env code path is unchanged.
+    install_fixed_noise(env.pipe)
+    install_microbatch(env.pipe, WAN_MICRO_BATCH)
+    print(f"[parity] wan micro-batch = {WAN_MICRO_BATCH} (total {args.num_samples})")
 
     # Pin reset state ids to [0, num_envs) so the dataset frames feeding the
     # pipeline are byte-identical to the ones in collect_wan_inputs's

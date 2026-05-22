@@ -34,8 +34,14 @@ Each script:
    - OpenVLA-OFT: `do_sample=False` → argmax (the production eval samples
      with temperature 1.6, which hides kernel drift behind RNG noise — bad
      for a parity test),
-   - Wan: `seed=0`, `rand_device="cpu"` so the diffusion noise is
-     bit-identical across hardware,
+   - Wan: the diffusion noise is pinned to a **fixed artifact**
+     (`goldens/wan_fixed_noise.pt`) loaded byte-for-byte on every machine.
+     `rand_device="cpu"` alone is NOT enough: `torch.randn`'s Box-Muller
+     transform uses transcendental / SIMD ops whose results differ by 1–2 ULP
+     between x86 (GPU host) and aarch64 (NPU host), which would silently desync
+     the inputs. See `common.install_fixed_noise`. Each Wan forward is also split
+     into `WAN_MICRO_BATCH` (default 4) chunks so the NPU's peak memory stays low
+     without dropping coverage (`common.install_microbatch`),
 4. runs twice and checks **self-consistency** before saving,
 5. dumps a golden file under `tests/parity/goldens/` containing every
    tensor of interest plus SHA256s.
