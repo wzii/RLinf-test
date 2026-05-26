@@ -342,22 +342,33 @@ def _probe_pipe_target_device(pipe) -> torch.device:
 
 
 def pin_pipe_device(pipe) -> torch.device:
-    """Set ``pipe.device`` to where the model parameters actually live.
+    """Set ``pipe.device`` *and* move every model sub-module to the probed
+    accelerator device.
 
     Many diffsynth pipeline methods (``preprocess_image``, ``preprocess_video``,
-    the original ``generate_noise``, ...) do ``x.to(device=self.device)``.
-    RLinf's ``WanEnv._build_pipeline`` hardcodes ``pipe.device='cuda:0'``, and
-    NPU adaptations typically move the model sub-modules to npu but leave the
-    pipe attribute alone. On a CUDA-disabled NPU torch build, any of those
-    ``.to(device='cuda:0')`` calls then triggers ``torch.cuda._lazy_init()``
-    and crashes with::
+    the original ``generate_noise``, ``vae.encode``, ...) read ``self.device``
+    and either ``.to()`` inputs onto it or expect the model weights to be on
+    it.  RLinf's ``WanEnv._build_pipeline`` hardcodes ``pipe.device='cuda:0'``;
+    NPU adaptations may move *some* sub-modules to npu and leave others on cpu
+    (e.g. only the DiT is moved, the VAE stays on cpu).  The two failure modes
+    we have seen so far:
 
-        AssertionError: Torch not compiled with CUDA enabled
+    * NPU torch build crashes with ``AssertionError: Torch not compiled with
+      CUDA enabled`` inside ``image.to(device=self.device)``
+      (``self.device='cuda:0'`` string).
+    * ``RuntimeError: Expected all tensors to be on the same device, but found
+      at least two devices, npu:0 and cpu`` inside conv3d when ``pipe.device``
+      is npu but ``pipe.vae`` weights are still on cpu.
 
-    Setting ``pipe.device`` to the probed real device fixes every downstream
-    consumer in one shot. The proper home for this fix is RLinf's
-    ``WanEnv._build_pipeline`` (or the user's NPU adapter for it), but the
-    parity test must work without depending on that.
+    Fix: pin ``pipe.device`` to the probed device AND move the model
+    sub-modules to it, so every downstream consumer sees a consistent device.
+    If the pipe is using ``enable_vram_management`` (CPU offload), we leave
+    sub-modules alone and let the onload/offload lifecycle handle them --
+    moving them manually would defeat the offload.
+
+    Proper home for this fix is RLinf's ``WanEnv._build_pipeline`` (or the
+    user's NPU adapter for it), but the parity test must work without
+    depending on that.
 
     Returns the resolved device for logging.
     """
@@ -370,6 +381,32 @@ def pin_pipe_device(pipe) -> torch.device:
         except (AttributeError, TypeError) as exc:
             print(f"[parity][WARN] could not set pipe.device "
                   f"({current} -> {probed}): {exc}")
+
+    if getattr(pipe, "vram_management_enabled", False):
+        print("[parity] vram_management is enabled; "
+              "leaving sub-modules in place (onload will move them)")
+        return probed
+
+    moved: list[str] = []
+    for attr in ("dit", "denoising_model", "transformer", "text_encoder", "vae"):
+        m = getattr(pipe, attr, None)
+        if m is None or not hasattr(m, "to"):
+            continue
+        try:
+            param_dev: Optional[torch.device] = None
+            if hasattr(m, "parameters"):
+                try:
+                    param_dev = next(iter(m.parameters())).device
+                except StopIteration:
+                    pass
+            if param_dev is not None and str(param_dev) == str(probed):
+                continue  # already on the target device
+            m.to(probed)
+            moved.append(f"{attr}({param_dev}->{probed})")
+        except Exception as exc:
+            print(f"[parity][WARN] could not move pipe.{attr} to {probed}: {exc}")
+    if moved:
+        print(f"[parity] moved sub-modules: {', '.join(moved)}")
     return probed
 
 
