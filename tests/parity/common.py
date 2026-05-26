@@ -22,7 +22,7 @@ import random
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -292,15 +292,44 @@ def device_label(device: torch.device) -> str:
 WAN_FIXED_NOISE_PATH = GOLDENS_DIR / "wan_fixed_noise.pt"
 
 
+def _available_accelerator() -> Optional[torch.device]:
+    """Return the actually-available compute accelerator, or None.
+
+    Prefers NPU over CUDA -- the parity test only runs on one or the other,
+    and on an NPU machine ``torch.cuda`` is not even compiled in. Order is
+    fine either way; we just need *some* accelerator if one exists.
+    """
+    # NPU first: importing torch_npu registers the npu backend on torch.
+    try:
+        import torch_npu  # noqa: F401
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.device(f"npu:{torch.npu.current_device()}")
+    except ImportError:
+        pass
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return None
+
+
 def _probe_pipe_target_device(pipe) -> torch.device:
-    """Resolve the pipe's *actual* compute device from a model parameter.
+    """Resolve the pipe's *intended* compute device.
 
     ``pipe.device`` can be a stale string (e.g. ``"cuda:0"``) even when the
     model components have been moved elsewhere -- RLinf's ``WanEnv._build_pipeline``
-    hardcodes ``cuda:0`` and NPU adaptations may patch the submodules but leave
-    ``pipe.device`` untouched. Reading any parameter's ``.device`` gives the
-    truth without risking ``torch.cuda._lazy_init`` on a CUDA-disabled build.
+    hardcodes ``cuda:0`` and NPU adaptations patch the submodules but leave
+    ``pipe.device`` untouched. We also can't blindly trust a model parameter's
+    ``.device``: with diffsynth's ``enable_vram_management`` the weights live
+    on CPU when idle and only move back to the accelerator at forward time --
+    a probe done before forward would return ``cpu`` and we would then pin
+    ``pipe.device='cpu'``, defeating the onload that puts weights back on NPU.
+
+    Strategy: if an actual accelerator is available on this machine, return
+    it. Only fall back to model parameters when we have no accelerator at all
+    (CPU-only debug run).
     """
+    accel = _available_accelerator()
+    if accel is not None:
+        return accel
     for attr in ("dit", "denoising_model", "transformer", "text_encoder", "vae"):
         m = getattr(pipe, attr, None)
         if m is None or not hasattr(m, "parameters"):
@@ -309,7 +338,6 @@ def _probe_pipe_target_device(pipe) -> torch.device:
             return next(iter(m.parameters())).device
         except (StopIteration, AttributeError, TypeError):
             continue
-    # Fallback: trust pipe.device if the probe failed (CPU-only debug runs).
     return torch.device(getattr(pipe, "device", "cpu"))
 
 
