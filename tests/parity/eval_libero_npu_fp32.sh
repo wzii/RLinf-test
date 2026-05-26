@@ -167,6 +167,14 @@ export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-0}"  # legacy ali
 export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-${RLINF_RAY_WAIT:-60}}"
 export RAY_DISABLE_DOCKER_CPU_WARNING="${RAY_DISABLE_DOCKER_CPU_WARNING:-1}"
 
+# On shared NPU/GPU hosts, Ray's memory monitor watches the WHOLE NODE memory
+# (not just your allocation) and kills your newest worker when total node mem
+# crosses 95 %.  If other tenants are using the host you'll be killed for
+# their consumption.  Disable Ray's pre-emptive killer; the kernel will still
+# OOM-kill if you truly exhaust your allocation.  Set RAY_memory_monitor_refresh_ms
+# explicitly (non-zero) to re-enable.
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+
 # Warn (don't auto-kill) if a stale Ray instance is detected, since killing
 # someone else's training would be bad. User can run `ray stop --force` if
 # they confirm it's their own.
