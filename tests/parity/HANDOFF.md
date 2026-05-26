@@ -98,3 +98,36 @@ diff against the NPU run is real hardware/kernel drift, not flakiness.
   the inputs themselves diverged and the comparison is invalid.
 - Full description of the testing approach is in
   `tests/parity/README.md`.
+
+## GPU baseline eval results (for reference)
+
+Measured on the GPU host with `eval_embodied_agent.py` on LIBERO Spatial,
+checkpoint `Openvla-oft-SFT-libero-spatial-traj1`, 50 trajectories,
+config: `total_num_envs=1`, `eval_rollout_epoch=50`.
+
+| Attention | `success_once` | `success_at_end` |
+|---|---|---|
+| bf16 (default) | **66 %** | 40 % |
+| fp32 patch | **68 %** | 30 % |
+
+The ±2 pp difference is within the ±7 pp noise floor for 50 trajectories.
+The fp32 patch has no meaningful effect on GPU; its purpose is cross-arch parity.
+
+### Container gotchas when running LIBERO eval (not parity tests)
+
+These issues affect `eval_embodied_agent.py` in a containerised environment;
+the parity scripts do not run MuJoCo and are unaffected.
+
+**OMP thread exhaustion** (`pids.max`): MuJoCo inherits `OMP_NUM_THREADS` from
+the parent process (default = `nproc`, often 64–127).  With many concurrent env
+workers this exceeds the container's `pids.max` cgroup limit and crashes inside
+`mujoco.MjModel.from_xml_string`.  Fix: set `OMP_NUM_THREADS=1` before launching
+the eval (or patch `rlinf/envs/libero/venv.py:_worker` to set it at subprocess
+entry).  Use one env worker and more rollout epochs instead of many parallel envs.
+
+**NCCL watchdog EAGAIN**: `MultiChannelProcessGroup` always creates NCCL process
+groups when GPUs are available, even for CPU-tensor (LIBERO obs) workloads.  The
+NCCL socket rendezvous on the same GPU device can return `EAGAIN`, which the
+watchdog converts to SIGABRT.  Fix: `TORCH_NCCL_ASYNC_ERROR_HANDLING=0
+NCCL_ASYNC_ERROR_HANDLING=0` at eval launch.  The data path still uses GLOO;
+the idle NCCL groups do not affect correctness.

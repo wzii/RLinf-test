@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import multiprocessing
-import os
-import time
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -83,28 +81,7 @@ def _worker(
     p: connection.Connection,
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
-    extra_env: Optional[dict] = None,
 ) -> None:
-    # Apply extra env vars before any MuJoCo / OpenGL initialisation.
-    # With multiprocessing.spawn the child process starts fresh and may not
-    # inherit MUJOCO_GL / PYOPENGL_PLATFORM from the parent's runtime_env.
-    import os as _os
-    # Unconditionally limit OpenMP threads in each spawned env-worker subprocess.
-    # Without this, MuJoCo spawns O(num_cpus) threads per process.  With 50+
-    # concurrent workers that exhausts virtual-address space for thread stacks,
-    # causing RuntimeError inside mujoco.MjModel.from_xml_string.
-    # The RLINF_ENV_OMP_THREADS env var lets callers override if needed.
-    _omp = _os.environ.get('RLINF_ENV_OMP_THREADS', '1')
-    _os.environ['OMP_NUM_THREADS'] = _omp
-    _os.environ['MKL_NUM_THREADS'] = _omp
-    # Ensure EGL rendering is configured before any MuJoCo/robosuite import.
-    # These may not be set in spawned subprocesses even if parent process had them.
-    _os.environ.setdefault('MUJOCO_GL', 'egl')
-    _os.environ.setdefault('PYOPENGL_PLATFORM', 'egl')
-    if extra_env:
-        for k, v in extra_env.items():
-            _os.environ[k] = v
-
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
     ) -> None:
@@ -190,16 +167,7 @@ def _worker(
 
 
 class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
-    # Environment variables that must be forwarded to the spawned subprocess
-    # because multiprocessing.spawn on Linux may not inherit them from the
-    # Ray worker's runtime_env.  MUJOCO_GL and PYOPENGL_PLATFORM control
-    # headless / EGL rendering; missing them causes MuJoCo XML loading errors.
-    # OMP_NUM_THREADS is forwarded so a deliberate user override propagates.
-    _FORWARD_ENV_VARS = ("MUJOCO_GL", "PYOPENGL_PLATFORM", "MUJOCO_EGL_DEVICE_ID",
-                         "EGL_DEVICE_ID", "MUJOCO_EGL_DEVICE_INDEX", "OMP_NUM_THREADS")
-
     def __init__(self, env_fn: Callable[[], gym.Env], share_memory: bool = False):
-        import os as _os
         ctx = multiprocessing.get_context("spawn")
         self.parent_remote, self.child_remote = ctx.Pipe()
         self.share_memory = share_memory
@@ -210,16 +178,11 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
             dummy.close()
             del dummy
             self.buffer = _setup_buf(obs_space)
-        # Forward rendering-related env vars so spawned workers can
-        # initialise EGL/OSMesa before MuJoCo is first imported.
-        extra_env = {k: v for k in self._FORWARD_ENV_VARS
-                     if (v := _os.environ.get(k)) is not None}
         args = (
             self.parent_remote,
             self.child_remote,
             CloudpickleWrapper(env_fn),
             self.buffer,
-            extra_env,
         )
         self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
@@ -232,32 +195,8 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
 
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
-    # Spawn environment workers in batches to avoid exhausting OS resources
-    # (EGL contexts, virtual memory for thread stacks) when creating many
-    # parallel subprocess workers simultaneously.
-    #
-    # Defaults: batch of 10, 2 s gap.  Override via env vars:
-    #   RLINF_ENV_SPAWN_BATCH  – workers per batch  (0 = all at once)
-    #   RLINF_ENV_SPAWN_DELAY  – seconds between batch starts
-    _DEFAULT_SPAWN_BATCH = 10
-    _DEFAULT_SPAWN_DELAY = 2.0
-
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
-        batch_size = int(os.environ.get("RLINF_ENV_SPAWN_BATCH",
-                                        self._DEFAULT_SPAWN_BATCH))
-        batch_delay = float(os.environ.get("RLINF_ENV_SPAWN_DELAY",
-                                           self._DEFAULT_SPAWN_DELAY))
-        if batch_size <= 0:
-            batch_size = len(env_fns)  # effectively disabled
-
-        _counter = [0]
-
         def worker_fn(fn: Callable[[], gym.Env]) -> ReconfigureSubprocEnvWorker:
-            idx = _counter[0]
-            _counter[0] += 1
-            # Pause before starting each new batch (except the very first).
-            if idx > 0 and idx % batch_size == 0:
-                time.sleep(batch_delay)
             return ReconfigureSubprocEnvWorker(fn, share_memory=False)
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
