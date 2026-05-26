@@ -151,12 +151,30 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
 
 # OMP / MUJOCO / NCCL workarounds documented in tests/parity/HANDOFF.md.
+# MUJOCO_GL=osmesa is the right default for NPU hosts (no GPU EGL context
+# available -- osmesa is pure software OpenGL).  GPU hosts can override with
+# MUJOCO_GL=egl for ~5-10x faster MuJoCo rendering.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-0}"
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-0}"  # legacy alias
+
+# Ray raylet sometimes loses the GCS-registration race on first start
+# (especially on NPU hosts / inside containers).  The default 10 s window is
+# too tight; 60 s is comfortable.  Override RLINF_RAY_WAIT to tune further.
+export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-${RLINF_RAY_WAIT:-60}}"
+export RAY_DISABLE_DOCKER_CPU_WARNING="${RAY_DISABLE_DOCKER_CPU_WARNING:-1}"
+
+# Warn (don't auto-kill) if a stale Ray instance is detected, since killing
+# someone else's training would be bad. User can run `ray stop --force` if
+# they confirm it's their own.
+if pgrep -f "ray::|raylet|gcs_server" > /dev/null 2>&1; then
+    echo "[parity][WARN] existing Ray processes detected on this host."
+    echo "               If this run hangs at 'The current node timed out during startup',"
+    echo "               run: ray stop --force ; rm -rf /tmp/ray  (only if those processes are yours)"
+fi
 
 # LIBERO-specific
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"

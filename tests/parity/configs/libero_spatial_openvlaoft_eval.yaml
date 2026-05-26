@@ -30,14 +30,13 @@ cluster:
   num_nodes: 1
   component_placement:
     actor,env,rollout: all
+  # "node0" is a label only; it does NOT require GPU/NPU/CPU specifically.
+  # The accelerator is whatever the host has -- detected at runtime by RLinf.
+  # MUJOCO_GL / PYOPENGL_PLATFORM are exported by eval_libero_npu_fp32.sh
+  # so we do not duplicate them here.
   node_groups:
-    - label: "gpu_node"
+    - label: "node0"
       node_ranks: "0"
-      env_configs:
-        - node_ranks: "0"
-          env_vars:
-            - MUJOCO_GL: egl
-            - PYOPENGL_PLATFORM: egl
 
 runner:
   task_type: embodied
