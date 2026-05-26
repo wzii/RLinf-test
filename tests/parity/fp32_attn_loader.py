@@ -34,10 +34,39 @@ import sys
 _MARKER = "__rlinf_parity_fp32_attn_installed__"
 _VERBOSE = os.environ.get("PARITY_FP32_ATTN_VERBOSE", "0") == "1"
 
+# PARITY_ATTN_DTYPE lets you swap the compute dtype of the patched attention
+# without rewriting the loader. fp32 is the default and the only value tested
+# to actually fix GPU↔NPU divergence (token agreement 20% → 97.6 %). fp16/bf16
+# are knobs for ablation -- you can use them to check whether matching dtype
+# alone is enough, or whether the full fp32 cast is what does the work.
+#   fp32  -> q.float()    (default)
+#   fp16  -> q.half()
+#   bf16  -> q.to(torch.bfloat16)
+_DTYPE_ENV = os.environ.get("PARITY_ATTN_DTYPE", "fp32").lower()
+
 
 def _log(msg: str) -> None:
     # Stay quiet by default in workers; only the first install per process logs.
     print(f"[parity] {msg} (PID {os.getpid()})", file=sys.stderr, flush=True)
+
+
+def _resolve_compute_dtype():
+    """Parse PARITY_ATTN_DTYPE and return the torch dtype to do attention in.
+
+    Returns None if the requested dtype is invalid (the caller should bail).
+    """
+    import torch
+    table = {
+        "fp32": torch.float32, "float32": torch.float32, "f32": torch.float32,
+        "fp16": torch.float16, "float16": torch.float16, "f16": torch.float16, "half": torch.float16,
+        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+    }
+    dt = table.get(_DTYPE_ENV)
+    if dt is None:
+        _log(f"WARNING: PARITY_ATTN_DTYPE={_DTYPE_ENV!r} not recognised; "
+             f"using fp32. Valid: fp32 / fp16 / bf16")
+        return torch.float32
+    return dt
 
 
 def _install() -> None:
@@ -125,11 +154,12 @@ def _install() -> None:
                 last = causal_mask[:, :, -1, :].clone()
                 causal_mask = last.unsqueeze(2).expand(-1, -1, D, -1)
 
-            qf, kf, vf = q.float(), k.float(), v.float()
+            compute_dtype = _resolve_compute_dtype()
+            qf, kf, vf = q.to(compute_dtype), k.to(compute_dtype), v.to(compute_dtype)
             scale = 1.0 / math.sqrt(self.head_dim)
             attn = torch.matmul(qf, kf.transpose(-2, -1)) * scale
             if causal_mask is not None:
-                attn = attn + causal_mask.float()
+                attn = attn + causal_mask.to(compute_dtype)
             attn = F.softmax(attn, dim=-1)
             if self.training and self.attention_dropout > 0.0:
                 attn = F.dropout(attn, p=self.attention_dropout)
@@ -142,7 +172,8 @@ def _install() -> None:
 
         setattr(_fp32_forward, _MARKER, True)
         LlamaSdpaAttention.forward = _fp32_forward
-        _log("fp32 attention patch installed (transformers ≤4.45 path)")
+        _log(f"attention patch installed (transformers ≤4.45 path, "
+             f"compute dtype = {_DTYPE_ENV})")
         return
 
     # ── Path B: transformers ≥ 4.46 — module-level sdpa_attention_forward ──
@@ -164,11 +195,14 @@ def _install() -> None:
 
     def _fp32_eager_attn(module, query, key, value, attention_mask,
                          scaling, dropout=0.0, **kwargs):
-        qf, kf, vf = query.float(), key.float(), value.float()
+        compute_dtype = _resolve_compute_dtype()
+        qf = query.to(compute_dtype)
+        kf = key.to(compute_dtype)
+        vf = value.to(compute_dtype)
         attn = torch.matmul(qf, kf.transpose(-2, -1)) * scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-            attn = attn + causal_mask.float()
+            attn = attn + causal_mask.to(compute_dtype)
         attn = F.softmax(attn, dim=-1)
         if module.training and getattr(module, "attention_dropout", 0.0) > 0.0:
             attn = F.dropout(attn, p=module.attention_dropout)
@@ -177,8 +211,8 @@ def _install() -> None:
 
     setattr(_fp32_eager_attn, _MARKER, True)
     setattr(_llama_mod, target_fn_name, _fp32_eager_attn)
-    _log(f"fp32 attention patch installed (transformers ≥4.46 path, "
-         f"replaced {target_fn_name})")
+    _log(f"attention patch installed (transformers ≥4.46 path, "
+         f"replaced {target_fn_name}, compute dtype = {_DTYPE_ENV})")
 
 
 _install()
