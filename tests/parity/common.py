@@ -292,6 +292,27 @@ def device_label(device: torch.device) -> str:
 WAN_FIXED_NOISE_PATH = GOLDENS_DIR / "wan_fixed_noise.pt"
 
 
+def _probe_pipe_target_device(pipe) -> torch.device:
+    """Resolve the pipe's *actual* compute device from a model parameter.
+
+    ``pipe.device`` can be a stale string (e.g. ``"cuda:0"``) even when the
+    model components have been moved elsewhere -- RLinf's ``WanEnv._build_pipeline``
+    hardcodes ``cuda:0`` and NPU adaptations may patch the submodules but leave
+    ``pipe.device`` untouched. Reading any parameter's ``.device`` gives the
+    truth without risking ``torch.cuda._lazy_init`` on a CUDA-disabled build.
+    """
+    for attr in ("dit", "denoising_model", "transformer", "text_encoder", "vae"):
+        m = getattr(pipe, attr, None)
+        if m is None or not hasattr(m, "parameters"):
+            continue
+        try:
+            return next(iter(m.parameters())).device
+        except (StopIteration, AttributeError, TypeError):
+            continue
+    # Fallback: trust pipe.device if the probe failed (CPU-only debug runs).
+    return torch.device(getattr(pipe, "device", "cpu"))
+
+
 def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
     """Monkeypatch ``pipe.generate_noise`` to return byte-identical noise across
     architectures.
@@ -300,6 +321,9 @@ def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
     crucially the NPU run -- loads the same bytes. Keyed by ``(seed, shape)`` so
     multiple configs in one process each get their own stable noise. Transfer
     ``goldens/wan_fixed_noise.pt`` to the NPU host alongside the goldens.
+
+    Target device is probed from an actual model parameter rather than read
+    from ``pipe.device``, which can be a stale ``cuda:0`` string on NPU.
     """
     cache: dict[tuple, torch.Tensor] = {}
     if path.exists():
@@ -322,8 +346,9 @@ def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
         else:
             print(f"[parity] fixed noise: reused {key}")
         noise = cache[key]
-        return noise.to(dtype=torch_dtype or pipe.torch_dtype,
-                        device=device or pipe.device)
+        target_device = device if device is not None else _probe_pipe_target_device(pipe)
+        target_dtype = torch_dtype or getattr(pipe, "torch_dtype", torch.float32)
+        return noise.to(dtype=target_dtype, device=target_device)
 
     pipe.generate_noise = _generate_noise
 
