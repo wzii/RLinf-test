@@ -82,9 +82,66 @@ remove_pth() {
     fi
 }
 
-trap 'rc=$?; remove_pth; exit $rc' EXIT
+# ── eval-config patch/unpatch ───────────────────────────────────────────────
+# The launcher needs a Hydra config that exists in $EMBODIED_PATH/config/.
+# We ship one in tests/parity/configs/ and copy it in transiently. If the
+# user already has a same-named config we use theirs and skip the install.
+RLINF_CONFIG_DIR="$REPO/examples/embodiment/config"
+PARITY_CONFIG_DIR="$PARITY_DIR/configs"
+INSTALLED_CONFIG=""   # set by install_config when we actually copy
+
+install_config() {
+    local cfg_name="$1"
+    local dst="$RLINF_CONFIG_DIR/${cfg_name}.yaml"
+    local src="$PARITY_CONFIG_DIR/${cfg_name}.yaml"
+    if [ -f "$dst" ]; then
+        echo "[parity] using existing config: $dst"
+        return 0
+    fi
+    if [ -f "$src" ]; then
+        cp "$src" "$dst"
+        INSTALLED_CONFIG="$dst"
+        echo "[parity] installed config: $src -> $dst"
+        return 0
+    fi
+    echo "[parity] ERROR: config '${cfg_name}.yaml' not found in either:" >&2
+    echo "          $RLINF_CONFIG_DIR/" >&2
+    echo "          $PARITY_CONFIG_DIR/" >&2
+    echo "[parity] available in $RLINF_CONFIG_DIR/:" >&2
+    if [ -d "$RLINF_CONFIG_DIR" ]; then
+        find "$RLINF_CONFIG_DIR" -maxdepth 1 -name '*.yaml' \
+            -printf '          %f\n' 2>/dev/null | sort >&2
+    fi
+    echo "[parity] available in $PARITY_CONFIG_DIR/:" >&2
+    if [ -d "$PARITY_CONFIG_DIR" ]; then
+        find "$PARITY_CONFIG_DIR" -maxdepth 1 -name '*.yaml' \
+            -printf '          %f\n' 2>/dev/null | sort >&2
+    fi
+    return 2
+}
+
+remove_config() {
+    if [ -n "$INSTALLED_CONFIG" ] && [ -f "$INSTALLED_CONFIG" ]; then
+        rm -f "$INSTALLED_CONFIG"
+        echo "[parity] removed installed config: $INSTALLED_CONFIG"
+    fi
+}
+
+_cleanup() {
+    local rc=$?
+    # Kill any of our own children that are still running (the eval subprocess,
+    # tee, etc.).  Required so the trap can run promptly on SIGTERM / SIGHUP
+    # instead of waiting for the child to exit.
+    pkill -TERM -P $$ 2>/dev/null || true
+    remove_pth
+    remove_config
+    exit "$rc"
+}
+trap _cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 141' PIPE
+trap 'exit 129' HUP
 
 install_pth
 
@@ -112,6 +169,12 @@ EXTRA_ARGS=()
 if [ "${1:-}" = "--" ]; then
     shift
     EXTRA_ARGS=("$@")
+fi
+
+# Install the config (uses existing user-side YAML if present, otherwise
+# copies in the parity-side one for the duration of this run).
+if ! install_config "$CONFIG_NAME"; then
+    exit 2
 fi
 
 # Where the eval script writes its log.
