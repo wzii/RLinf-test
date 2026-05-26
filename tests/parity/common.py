@@ -313,6 +313,38 @@ def _probe_pipe_target_device(pipe) -> torch.device:
     return torch.device(getattr(pipe, "device", "cpu"))
 
 
+def pin_pipe_device(pipe) -> torch.device:
+    """Set ``pipe.device`` to where the model parameters actually live.
+
+    Many diffsynth pipeline methods (``preprocess_image``, ``preprocess_video``,
+    the original ``generate_noise``, ...) do ``x.to(device=self.device)``.
+    RLinf's ``WanEnv._build_pipeline`` hardcodes ``pipe.device='cuda:0'``, and
+    NPU adaptations typically move the model sub-modules to npu but leave the
+    pipe attribute alone. On a CUDA-disabled NPU torch build, any of those
+    ``.to(device='cuda:0')`` calls then triggers ``torch.cuda._lazy_init()``
+    and crashes with::
+
+        AssertionError: Torch not compiled with CUDA enabled
+
+    Setting ``pipe.device`` to the probed real device fixes every downstream
+    consumer in one shot. The proper home for this fix is RLinf's
+    ``WanEnv._build_pipeline`` (or the user's NPU adapter for it), but the
+    parity test must work without depending on that.
+
+    Returns the resolved device for logging.
+    """
+    probed = _probe_pipe_target_device(pipe)
+    current = getattr(pipe, "device", None)
+    if str(current) != str(probed):
+        try:
+            pipe.device = probed
+            print(f"[parity] pipe.device pinned: {current} -> {probed}")
+        except (AttributeError, TypeError) as exc:
+            print(f"[parity][WARN] could not set pipe.device "
+                  f"({current} -> {probed}): {exc}")
+    return probed
+
+
 def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
     """Monkeypatch ``pipe.generate_noise`` to return byte-identical noise across
     architectures.
@@ -322,9 +354,11 @@ def install_fixed_noise(pipe, path: Path = WAN_FIXED_NOISE_PATH) -> None:
     multiple configs in one process each get their own stable noise. Transfer
     ``goldens/wan_fixed_noise.pt`` to the NPU host alongside the goldens.
 
-    Target device is probed from an actual model parameter rather than read
-    from ``pipe.device``, which can be a stale ``cuda:0`` string on NPU.
+    Also pins ``pipe.device`` (via :func:`pin_pipe_device`) so other diffsynth
+    methods that read it (``preprocess_image``, ``preprocess_video``, ...) do
+    not crash with ``cuda:0`` on an NPU build.
     """
+    pin_pipe_device(pipe)
     cache: dict[tuple, torch.Tensor] = {}
     if path.exists():
         cache = torch.load(path, map_location="cpu")
