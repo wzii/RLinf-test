@@ -55,96 +55,133 @@ def main():
     device = pick_device()
     print_env_banner(device, {"impl": "patch-verify"})
 
-    # ── Step 0: 在任何模型加载之前检查 LlamaSdpaAttention ──────────────────
-    print("\n=== Step 0: LlamaSdpaAttention.forward BEFORE get_model ===")
+    # ── Step 0: 检查 transformers 版本和 attention 类 ─────────────────────
+    print("\n=== Step 0: transformers version + attention class BEFORE get_model ===")
+    try:
+        import transformers as _tf
+        print(f"  transformers version: {_tf.__version__}")
+    except Exception:
+        pass
+
+    _has_sdpa_cls = False
     try:
         from transformers.models.llama.modeling_llama import LlamaSdpaAttention
-        print(f"  forward: {_fmt_fwd(LlamaSdpaAttention.forward)}")
+        _has_sdpa_cls = True
+        print(f"  LlamaSdpaAttention.forward: {_fmt_fwd(LlamaSdpaAttention.forward)}")
     except ImportError:
-        print("  LlamaSdpaAttention not found in this transformers version")
+        print("  LlamaSdpaAttention NOT found (transformers ≥4.46 unified class)")
+
+    # Check for ≥4.46 unified path
+    from transformers.models.llama import modeling_llama as _llama_mod
+    for _fn_name in ("sdpa_attention_forward", "eager_attention_forward"):
+        _fn = getattr(_llama_mod, _fn_name, None)
+        if _fn is not None:
+            print(f"  {_fn_name}: {_fmt_fwd(_fn)}")
+
+    if not _has_sdpa_cls and not any(
+        hasattr(_llama_mod, n) for n in ("sdpa_attention_forward", "eager_attention_forward")
+    ):
+        print("  Neither LlamaSdpaAttention nor sdpa/eager_attention_forward found!")
         return 1
 
-    # ── Step 1: 安装 fp32 patch（加载模型之前）───────────────────────────────
-    print("\n=== Step 1: install_fp32_attention (before get_model) ===")
-    call_counter = [0]      # 用列表方便闭包修改
-
-    # 用带计数器的版本替换 _fp32_forward
+    # ── Step 1: 安装带计数器的 fp32 patch（加载模型之前）─────────────────────
+    print("\n=== Step 1: install counted fp32 patch (before get_model) ===")
     import math as _math
     import torch.nn.functional as _F
-    from transformers.models.llama.modeling_llama import (
-        apply_rotary_pos_emb, repeat_kv,
-    )
+    from transformers.models.llama import modeling_llama as _llama_mod
 
-    def _fp32_forward_counted(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position=None,
-        **kwargs,
-    ):
-        call_counter[0] += 1
-        if call_counter[0] <= 2:        # 只打印前两次避免刷屏
-            print(f"  [counter] _fp32_forward_counted called! total={call_counter[0]}")
+    call_counter = [0]
 
-        if output_attentions:
-            return super(LlamaSdpaAttention, self).forward(
-                hidden_states=hidden_states, attention_mask=attention_mask,
-                position_ids=position_ids, past_key_value=past_key_value,
-                output_attentions=output_attentions, use_cache=use_cache,
-                cache_position=cache_position,
-            )
+    if _has_sdpa_cls:
+        # transformers ≤4.45: 替换 LlamaSdpaAttention.forward
+        from transformers.models.llama.modeling_llama import (
+            LlamaSdpaAttention, apply_rotary_pos_emb, repeat_kv,
+        )
 
-        bsz, q_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states)
-        key_states   = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        def _fp32_forward_counted(self, hidden_states, attention_mask=None,
+                                   position_ids=None, past_key_value=None,
+                                   output_attentions=False, use_cache=False,
+                                   cache_position=None, **kwargs):
+            call_counter[0] += 1
+            if call_counter[0] <= 2:
+                print(f"  [counter] LlamaSdpaAttention _fp32_forward called! total={call_counter[0]}")
+            if output_attentions:
+                return super(LlamaSdpaAttention, self).forward(
+                    hidden_states=hidden_states, attention_mask=attention_mask,
+                    position_ids=position_ids, past_key_value=past_key_value,
+                    output_attentions=output_attentions, use_cache=use_cache,
+                    cache_position=cache_position,
+                )
+            bsz, q_len, _ = hidden_states.size()
+            query_states = self.q_proj(hidden_states)
+            key_states   = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+            query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states   = key_states  .view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            _pkv = getattr(self, "past_key_value", past_key_value)
+            if _pkv is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = _pkv.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states   = repeat_kv(key_states,   self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            causal_mask = attention_mask
+            if causal_mask is not None:
+                causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+                D = causal_mask.shape[-1]
+                last_row = causal_mask[:, :, -1, :].clone()
+                causal_mask = last_row.unsqueeze(2).expand(-1, -1, D, -1)
+            q, k, v = query_states.float(), key_states.float(), value_states.float()
+            scale = 1.0 / _math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if causal_mask is not None:
+                attn_weights = attn_weights + causal_mask.float()
+            attn_weights = _F.softmax(attn_weights, dim=-1)
+            if self.training and self.attention_dropout > 0.0:
+                attn_weights = _F.dropout(attn_weights, p=self.attention_dropout)
+            attn_output = torch.matmul(attn_weights, v).to(query_states.dtype)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
 
-        query_states = query_states.view(bsz, q_len, self.num_heads,           self.head_dim).transpose(1, 2)
-        key_states   = key_states  .view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        _orig_forward_id = id(LlamaSdpaAttention.forward)
+        LlamaSdpaAttention.forward = _fp32_forward_counted
+        _patched_obj = LlamaSdpaAttention
+        _patched_attr = "forward"
+        print(f"  Patched LlamaSdpaAttention.forward: {_orig_forward_id:#x} -> {id(_fp32_forward_counted):#x}")
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    else:
+        # transformers ≥4.46: 替换 modeling_llama 模块级别函数
+        _fn_name = next((n for n in ("sdpa_attention_forward", "eager_attention_forward")
+                         if hasattr(_llama_mod, n)), None)
+        if _fn_name is None:
+            print("  No patchable attention function found! Cannot install counter patch.")
+            return 1
+        _orig_fn = getattr(_llama_mod, _fn_name)
 
-        _pkv = getattr(self, "past_key_value", past_key_value)
-        if _pkv is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = _pkv.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        def _fp32_attn_counted(module, query, key, value, attention_mask,
+                               scaling, dropout=0.0, **kwargs):
+            call_counter[0] += 1
+            if call_counter[0] <= 2:
+                print(f"  [counter] {_fn_name} fp32 called! total={call_counter[0]}")
+            q, k, v = query.float(), key.float(), value.float()
+            attn_w = torch.matmul(q, k.transpose(-2, -1)) * scaling
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+                attn_w = attn_w + causal_mask.float()
+            attn_w = _F.softmax(attn_w, dim=-1)
+            if module.training and getattr(module, "attention_dropout", 0.0) > 0.0:
+                attn_w = _F.dropout(attn_w, p=module.attention_dropout)
+            out = torch.matmul(attn_w, v).to(query.dtype)
+            return out, attn_w
 
-        key_states   = repeat_kv(key_states,   self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        causal_mask = attention_mask
-        if causal_mask is not None:
-            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
-            D = causal_mask.shape[-1]
-            last_row = causal_mask[:, :, -1, :].clone()
-            causal_mask = last_row.unsqueeze(2).expand(-1, -1, D, -1)
-
-        q = query_states.float()
-        k = key_states.float()
-        v = value_states.float()
-        scale = 1.0 / _math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if causal_mask is not None:
-            attn_weights = attn_weights + causal_mask.float()
-        attn_weights = _F.softmax(attn_weights, dim=-1)
-        if self.training and self.attention_dropout > 0.0:
-            attn_weights = _F.dropout(attn_weights, p=self.attention_dropout)
-        attn_output = torch.matmul(attn_weights, v).to(query_states.dtype)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None, past_key_value
-
-    _orig_forward_id = id(LlamaSdpaAttention.forward)
-    LlamaSdpaAttention.forward = _fp32_forward_counted
-    print(f"  Patched. forward id: {_orig_forward_id:#x} -> {id(LlamaSdpaAttention.forward):#x}")
+        setattr(_llama_mod, _fn_name, _fp32_attn_counted)
+        _patched_obj = _llama_mod
+        _patched_attr = _fn_name
+        print(f"  Patched {_fn_name} in modeling_llama: {id(_orig_fn):#x} -> {id(_fp32_attn_counted):#x}")
 
     # ── Step 2: 加载模型 ──────────────────────────────────────────────────────
     print("\n=== Step 2: get_model ===")
@@ -155,32 +192,35 @@ def main():
     model = get_model(cfg, torch_dtype=torch.bfloat16).to(device).eval()
     print(f"  Model loaded in {time.time()-t0:.1f}s")
 
-    print("\n=== Step 3: LlamaSdpaAttention.forward AFTER get_model ===")
-    print(f"  forward: {_fmt_fwd(LlamaSdpaAttention.forward)}")
-    fwd_after_load = id(LlamaSdpaAttention.forward)
-    if fwd_after_load != id(_fp32_forward_counted):
-        print(f"  *** OVERRIDDEN! Our patch id={id(_fp32_forward_counted):#x} but class now has id={fwd_after_load:#x}")
-        print(f"  *** This means get_model (or torch_npu import) replaced our patch!")
+    print("\n=== Step 3: patch status AFTER get_model ===")
+    current_fn = getattr(_patched_obj, _patched_attr)
+    if _has_sdpa_cls:
+        expected_fn = _fp32_forward_counted
+        patch_id_str = f"LlamaSdpaAttention.forward id={id(current_fn):#x}"
     else:
-        print(f"  OK: our patch is still in place (id={fwd_after_load:#x})")
+        expected_fn = _fp32_attn_counted
+        patch_id_str = f"{_fn_name} id={id(current_fn):#x}"
+    if id(current_fn) != id(expected_fn):
+        print(f"  *** OVERRIDDEN after get_model! {patch_id_str} != expected id={id(expected_fn):#x}")
+        print(f"  Current fn: {_fmt_fwd(current_fn)}")
+    else:
+        print(f"  OK: patch still in place. {patch_id_str}")
 
-    # 还检查第一个 self_attn 实例上的 forward（可能是实例级别的绑定）
+    # 检查第一个 self_attn 实例的 class 和实例级 forward
     first_attn = next(
         (m for n, m in model.named_modules()
          if n == "language_model.model.layers.0.self_attn"),
         None,
     )
     if first_attn is not None:
-        inst_fwd = getattr(first_attn, "forward", None)
+        inst_fwd = first_attn.__dict__.get("forward")
         if inst_fwd is not None:
-            print(f"  instance forward: {_fmt_fwd(inst_fwd)}")
-            if id(inst_fwd) != id(_fp32_forward_counted):
-                print(f"  *** INSTANCE OVERRIDE: instance forward differs from class forward!")
-        print(f"  type(self_attn): {type(first_attn).__name__}  id={id(type(first_attn).forward):#x}")
+            print(f"  instance-level forward override: {_fmt_fwd(inst_fwd)}")
+        print(f"  type(self_attn): {type(first_attn).__name__}")
+        print(f"  class.forward id: {id(type(first_attn).forward):#x}")
 
     # ── Step 4: 运行 forward 并检查计数器 ────────────────────────────────────
     print("\n=== Step 4: run 1-sample forward ===")
-    # 用单个样本以减少测试时间
     inputs = collect_libero_image_inputs(n=1)
     env_obs = build_env_obs(inputs, device)
 
@@ -196,25 +236,31 @@ def main():
     print(f"  call_counter after forward:  {call_counter[0]}")
 
     if call_counter[0] == 0:
-        print("\n  *** DIAGNOSIS: _fp32_forward_counted was NEVER CALLED.")
-        print("  *** The model is NOT using our patched LlamaSdpaAttention.forward.")
-        # 打印更多诊断信息
-        print("\n  Possible causes:")
-        print("  a) torch_npu replaces LlamaSdpaAttention.forward after our patch")
-        print("  b) The model uses a different attention class (not LlamaSdpaAttention)")
-        print("  c) The model bypasses Python-level dispatch (C++ extension)")
+        print("\n  *** DIAGNOSIS: fp32 patch was NEVER CALLED during forward.")
+        print("  Possible causes:")
+        print("  a) The model uses a different attention class not covered by the patch")
+        print("  b) torch_npu/Ascend transformers override our patch after model load")
+        print("  c) Model bypasses Python-level dispatch (C++ extension)")
+        # Identify actual attention class(es)
         attn_classes = set()
         for n, m in model.named_modules():
-            if "self_attn" in n and n.count(".") == 4:  # layers.X.self_attn
+            if "self_attn" in n and n.count(".") == 4:
                 attn_classes.add(type(m).__name__)
-        print(f"\n  Actual attention class(es) in model: {attn_classes}")
-        # 检查是否有 __torch_function__ 或其他拦截
+        print(f"\n  Actual attention class(es): {attn_classes}")
         if first_attn is not None:
-            print(f"\n  self_attn MRO: {[c.__name__ for c in type(first_attn).__mro__]}")
+            print(f"  MRO: {[c.__name__ for c in type(first_attn).__mro__]}")
+        # Show what functions are in modeling_llama now
+        for fn in ("sdpa_attention_forward", "eager_attention_forward", "ALL_ATTENTION_FUNCTIONS"):
+            fn_obj = getattr(_llama_mod, fn, None)
+            if fn_obj is not None:
+                print(f"  {fn}: {_fmt_fwd(fn_obj) if callable(fn_obj) else fn_obj}")
     else:
-        print(f"\n  DIAGNOSIS: _fp32_forward_counted WAS called {call_counter[0]} times.")
-        print("  The patch is executing. NPU fp32==bf16 means Ascend's matmul/softmax")
-        print("  gives identical results in bf16 and fp32 precision.")
+        print(f"\n  DIAGNOSIS: fp32 patch WAS called {call_counter[0]} times.")
+        if _has_sdpa_cls:
+            print("  LlamaSdpaAttention.forward is executing our fp32 code.")
+        else:
+            print(f"  {_fn_name} in modeling_llama is executing our fp32 code.")
+        print("  If NPU fp32==bf16 still holds, Ascend's own attention == fp32 numerically.")
 
     # ── Step 5: 检查是否有实例级别的 _orig_forward ────────────────────────────
     print("\n=== Step 5: Check for instance-level forward overrides ===")
