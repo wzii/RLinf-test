@@ -26,7 +26,8 @@ from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
-
+from msprobe.core.config_check import ConfigChecker
+ConfigChecker.apply_patches()
 
 @hydra.main(
     version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"

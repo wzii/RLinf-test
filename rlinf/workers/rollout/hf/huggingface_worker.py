@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -31,7 +32,8 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
-
+from msprobe.pytorch import PrecisionDebugger, seed_all
+seed_all(seed=1234, mode=True)
 
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
@@ -455,6 +457,10 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        debugger = PrecisionDebugger(
+            task='statistics',
+            dump_path=os.environ.get('MSPROBE_DUMP_PATH', '/workspace/dump/'),
+        )
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
@@ -463,8 +469,11 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    debugger.start(model=self.hf_model)
                     actions, _ = self.predict(env_output["obs"], mode="eval")
+                    debugger.stop()
                     self.send_chunk_actions(output_channel, actions, mode="eval")
+                    debugger.step()
 
         if self.enable_offload:
             self.offload_model()
