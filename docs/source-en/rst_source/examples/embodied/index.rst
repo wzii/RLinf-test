@@ -515,6 +515,8 @@ as well as reinforcement learning training examples on real robots.
    pi0
    gr00t
    lingbotvla
+   sft_lingbotva
+   grpo_lingbotva
    dexbotic
    starvla
    mlp

@@ -6,6 +6,16 @@ action_dim: 7
 is_lora: false
 lora_rank: 4
 lora_path: null
+
+# ---- Flow-matching RL (Flow-SDE / Flow-Noise) ----
+# Default is the deterministic ODE so eval / SFT are unchanged. Online-RL
+# configs override noise_method to flow_sde / flow_noise / flow_cps.
+noise_method: flow_ode      # flow_ode | flow_sde | flow_noise | flow_cps
+noise_level: 0.7            # SDE diffusion scale / CPS rotation angle
+joint_logprob: false        # log-prob over all denoise steps vs a single step
+ignore_last: false          # never sample the terminal (sigma->0) step
+safe_get_logprob: false     # drop the Gaussian normalisation constant
+add_value_head: false       # critic head (GRPO is critic-free -> false)
 lingbotva:
   repo_path: ${oc.env:LINGBOT_VA_REPO_PATH}
   config_name: libero

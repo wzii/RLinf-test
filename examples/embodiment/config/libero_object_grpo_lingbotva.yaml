@@ -1,0 +1,208 @@
+# Online RL (GRPO) fine-tuning of LingBot-VA on LIBERO-Object with RLinf's
+# flow-matching RL (Flow-SDE / Flow-Noise).
+#
+# This builds on the LingBot-VA SFT + eval integration (PR #1220) and reuses
+# RLinf's flow-RL machinery (already used for openpi / lingbotvla). The action
+# stream of the Wan 2.2 video-diffusion transformer is denoised as a Flow-SDE
+# (default) or Flow-Noise MDP so GRPO can optimise it.
+#
+# Switch algorithms with a CLI override, e.g.:
+#   bash examples/embodiment/run_embodiment.sh libero_object_grpo_lingbotva \
+#       actor.model.noise_method=flow_noise
+#
+# NOTE: the flow-RL *math* is unit-tested (tests/unit_tests/test_lingbotva_flow_rl.py);
+# the Wan-transformer rollout/recompute plumbing requires GPU + the real
+# wan_va package and an SFT checkpoint to validate end-to-end.
+
+defaults:
+  - env/libero_object@env.train
+  - env/libero_object@env.eval
+  - model/lingbotva@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-7
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_object_grpo_lingbotva"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 20
+  save_interval: 20
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 8
+  update_epoch: 2
+  rollout_epoch: 8
+  eval_rollout_epoch: 1
+
+  reward_type: action_level
+  logprob_type: token_level
+  entropy_type: token_level
+
+  adv_type: grpo
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  kl_beta: 0.05
+  entropy_bonus: 0.0       # raise (e.g. 0.01) only with flow_noise
+  clip_ratio_high: 0.28
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 1.0
+  gae_lambda: 0.95
+
+  reward_coef: 1.0
+  filter_rewards: False
+  rewards_lower_bound: 0.5
+  rewards_upper_bound: 4.5
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: -1
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+
+  length_params:
+    max_new_token: null
+    max_length: 512
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    total_num_envs: 64
+    group_size: ${algorithm.group_size}
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+    reset_gripper_open: True
+    use_fixed_reset_state_ids: False
+    use_ordered_reset_state_ids: False
+    reward_coef: ${algorithm.reward_coef}
+
+  eval:
+    total_num_envs: 8
+    auto_reset: True
+    ignore_terminations: False
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    reset_gripper_open: True
+    is_eval: True
+    task_id_filter: null
+    init_params:
+      camera_heights: 128
+      camera_widths: 128
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  model:
+    model_type: lingbotva
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+    # Rollout samples actions through the eval backend (frozen inference
+    # transformer + VA_Server), so it must NOT load the FSDP training
+    # transformer. Flow-RL knobs must match the actor so prev_logprobs line up.
+    noise_method: ${actor.model.noise_method}
+    noise_level: ${actor.model.noise_level}
+    joint_logprob: ${actor.model.joint_logprob}
+    lingbotva:
+      training_mode: False
+      action_num_inference_steps: ${actor.model.lingbotva.action_num_inference_steps}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: True
+
+  model:
+    model_type: lingbotva
+    model_path: ${oc.env:LINGBOT_VA_MODEL_PATH}
+    precision: bf16
+    num_action_chunks: 12
+    action_dim: 7
+
+    # ---- flow-matching RL ----
+    noise_method: flow_sde   # flow_sde (default) | flow_noise | flow_cps
+    noise_level: 0.7
+    joint_logprob: False
+    add_value_head: False
+    safe_get_logprob: False
+
+    lingbotva:
+      repo_path: ${oc.env:LINGBOT_VA_REPO_PATH}
+      config_name: libero
+      enable_offload: false
+      action_per_frame: 4
+      # The actor needs the transformer exposed for FSDP + gradient recompute.
+      training_mode: True
+      attn_mode: torch
+      transformer_state_dict_path: ${oc.env:LINGBOT_VA_TRANSFORMER_STATE_DICT_PATH,null}
+      save_root: ./runtime/lingbotva_grpo
+      # Number of stochastic action denoise steps (one is sampled per rollout).
+      action_num_inference_steps: 10
+
+  optim:
+    lr: 1.0e-05
+    value_lr: 1.0e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-05
+    weight_decay: 0.01
+    clip_grad: 1.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

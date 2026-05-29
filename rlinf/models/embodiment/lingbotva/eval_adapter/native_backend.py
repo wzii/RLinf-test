@@ -661,6 +661,311 @@ class LingbotVALiberoBackend:
         torch.cuda.empty_cache()
         return frame_st_id + int(latent_model_input.shape[2])
 
+    # ------------------------------------------------------------------
+    # Flow-matching RL rollout
+    # ------------------------------------------------------------------
+
+    def _reshape_action_velocity(
+        self, action_noise_pred: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        """Reshape + CFG-combine the transformer action output into latent shape.
+
+        Lifted verbatim from the (non-last-step) branch of
+        :meth:`_infer_batch_impl` so the RL sampler produces the *same* velocity
+        tensor the deterministic ODE path consumes.
+        """
+        server = self._server
+        action_noise_pred = (
+            action_noise_pred.unflatten(
+                1,
+                (server.job_config.frame_chunk_size, server.action_per_frame),
+            )
+            .permute(0, 3, 1, 2)
+            .unsqueeze(-1)
+        )
+        if server.job_config.action_guidance_scale > 1:
+            action_noise_pred = action_noise_pred[
+                batch_size:
+            ] + server.job_config.action_guidance_scale * (
+                action_noise_pred[:batch_size] - action_noise_pred[batch_size:]
+            )
+        else:
+            action_noise_pred = action_noise_pred[:batch_size]
+        return action_noise_pred
+
+    def _action_velocity(
+        self,
+        actions: torch.Tensor,
+        raw_timestep: float,
+        *,
+        batch_size: int,
+        frame_st_id: int,
+        action_cond: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Predict the flow velocity for the action stream at ``raw_timestep``.
+
+        Same transformer call as the eval ODE loop; isolated so both the
+        deterministic sampler and the RL (SDE / Noise) sampler share one code
+        path. ``raw_timestep`` is in the scheduler's native units (not the
+        normalised sigma used by the SDE math).
+        """
+        server = self._server
+        input_dict = self._prepare_batch_input(
+            latent_model_input=None,
+            action_model_input=actions,
+            latent_t=float(raw_timestep),
+            action_t=float(raw_timestep),
+            latent_cond=None,
+            action_cond=action_cond,
+            frame_st_id=frame_st_id,
+        )
+        action_noise_pred = server.transformer(
+            input_dict["action_res_lst"],
+            update_cache=0,
+            cache_name=server.cache_name,
+            action_mode=True,
+        )
+        return self._reshape_action_velocity(action_noise_pred, batch_size)
+
+    @torch.no_grad()
+    def rl_rollout(
+        self,
+        obs_batch: list[dict[str, Any]],
+        prompts: list[str],
+        flow_cfg,
+        *,
+        noise_std_fn=None,
+        denoise_index: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, Any]:
+        """Roll out the action denoiser as a Flow-SDE / Flow-Noise MDP.
+
+        Runs the video-latent denoising deterministically (as in eval) to warm
+        the transformer KV cache, then denoises the action stream with the
+        stochastic flow-RL transition, collecting the chains and per-step
+        log-probs that GRPO needs.
+
+        Returns a dict with the clean ``actions`` ``[B, C, F, A, 1]``, the full
+        ``chains`` ``[B, S+1, C, F, A, 1]``, ``logprobs`` ``[B, ...]``, the
+        chosen ``denoise_index``, and a serialisable ``cond`` dict letting the
+        actor re-derive the velocity under gradient (see
+        ``LingbotVAActionModel._recompute_action_velocity``).
+
+        .. note::
+            The Wan-transformer calls here mirror :meth:`_infer_batch_impl`
+            exactly but have to be validated on GPU with the real ``wan_va``
+            package + checkpoint; the surrounding flow-RL math is unit-tested in
+            ``tests/unit_tests/test_lingbotva_flow_rl.py``.
+        """
+        from rlinf.models.embodiment.lingbotva import flow_rl as _flow_rl
+
+        if len(obs_batch) != len(prompts):
+            raise ValueError("rl_rollout expects equal numbers of obs and prompts.")
+
+        server = self._server
+        self._reset_batch_runtime(prompts)
+        frame_st_id = 0
+        batch_size = len(prompts)
+
+        obs_sequences = self._normalize_obs_sequences(obs_batch)
+        server.init_latent = self._encode_obs_batch(obs_sequences)
+
+        # --- deterministic video-latent denoise (warms the KV cache) ---
+        latents = torch.randn(
+            batch_size,
+            48,
+            server.job_config.frame_chunk_size,
+            server.latent_height,
+            server.latent_width,
+            device=server.device,
+            dtype=server.dtype,
+            generator=generator,
+        )
+        server.scheduler.set_timesteps(server.job_config.num_inference_steps)
+        timesteps = torch.nn.functional.pad(
+            server.scheduler.timesteps, (0, 1), mode="constant", value=0
+        )
+        if server.job_config.video_exec_step != -1:
+            timesteps = timesteps[: server.job_config.video_exec_step]
+        for step_idx, timestep in enumerate(timesteps):
+            last_step = step_idx == len(timesteps) - 1
+            latent_cond = server.init_latent[:, :, 0:1] if frame_st_id == 0 else None
+            input_dict = self._prepare_batch_input(
+                latent_model_input=latents,
+                action_model_input=None,
+                latent_t=float(timestep),
+                action_t=float(timestep),
+                latent_cond=latent_cond,
+                action_cond=None,
+                frame_st_id=frame_st_id,
+            )
+            video_noise_pred = server.transformer(
+                input_dict["latent_res_lst"],
+                update_cache=1 if last_step else 0,
+                cache_name=server.cache_name,
+                action_mode=False,
+            )
+            if not last_step or server.job_config.video_exec_step != -1:
+                video_noise_pred = self._data_seq_to_patch(
+                    server.job_config.patch_size,
+                    video_noise_pred,
+                    server.job_config.frame_chunk_size,
+                    server.latent_height,
+                    server.latent_width,
+                    batch_size=self._cfg_batch_size(batch_size),
+                )
+                if server.job_config.guidance_scale > 1:
+                    video_noise_pred = video_noise_pred[
+                        batch_size:
+                    ] + server.job_config.guidance_scale * (
+                        video_noise_pred[:batch_size] - video_noise_pred[batch_size:]
+                    )
+                else:
+                    video_noise_pred = video_noise_pred[:batch_size]
+                latents = server.scheduler.step(
+                    video_noise_pred, timestep, latents, return_dict=False
+                )
+            if latent_cond is not None:
+                latents[:, :, 0:1] = latent_cond
+
+        # --- stochastic action denoise (Flow-SDE / Flow-Noise) ---
+        server.action_scheduler.set_timesteps(
+            server.job_config.action_num_inference_steps
+        )
+        raw_timesteps = torch.nn.functional.pad(
+            server.action_scheduler.timesteps.to(torch.float32),
+            (0, 1),
+            mode="constant",
+            value=0,
+        )
+        sigmas = _flow_rl.build_sigma_schedule(
+            server.action_scheduler,
+            server.job_config.action_num_inference_steps,
+            device=server.device,
+        )
+        # Re-pad timesteps to align length with sigmas (S + 1).
+        if raw_timesteps.numel() != sigmas.numel():
+            raw_timesteps = raw_timesteps[: sigmas.numel()]
+
+        action_cond = (
+            torch.zeros(
+                [batch_size, server.job_config.action_dim, 1, server.action_per_frame, 1],
+                device=server.device,
+                dtype=server.dtype,
+            )
+            if frame_st_id == 0
+            else None
+        )
+        init_actions = torch.randn(
+            batch_size,
+            server.job_config.action_dim,
+            server.job_config.frame_chunk_size,
+            server.action_per_frame,
+            1,
+            device=server.device,
+            dtype=server.dtype,
+            generator=generator,
+        )
+
+        def velocity_fn(x_t, raw_t):
+            x_in = x_t.clone()
+            if action_cond is not None:
+                x_in[:, :, 0:1] = action_cond[:, :, 0:1]
+            return self._action_velocity(
+                x_in,
+                raw_t,
+                batch_size=batch_size,
+                frame_st_id=frame_st_id,
+                action_cond=action_cond,
+            ).to(torch.float32)
+
+        result = _flow_rl.rollout_action_chain(
+            init_actions.to(torch.float32),
+            sigmas.cpu(),
+            velocity_fn,
+            flow_cfg,
+            denoise_index=denoise_index,
+            noise_std_fn=noise_std_fn,
+            cond_times=raw_timesteps.cpu(),
+            generator=generator,
+        )
+
+        clean = result["actions"]
+        clean = clean.to(server.dtype)
+        clean[:, ~server.action_mask] *= 0
+        actions_np = self._postprocess_action_batch(clean)
+
+        # Capture the conditioning the actor needs to recompute the velocity
+        # under gradient. Everything is stored **batch-leading and un-CFG'd**
+        # (leading dim == batch_size) so the rollout worker's per-sample
+        # ``torch.split(..., dim=0)`` splitter handles it; the actor re-applies
+        # CFG duplication and rebuilds the wan_va input dicts from these
+        # tensors. Schedules are replicated per-sample; scalars are packed into
+        # an int meta tensor.
+        patch_size = server.job_config.patch_size
+        latent_token_per_chunk = (
+            server.job_config.frame_chunk_size
+            * server.latent_height
+            * server.latent_width
+        ) // (patch_size[0] * patch_size[1] * patch_size[2])
+        # Pre-CFG grid ids (the eval builder repeats by batch *after* CFG;
+        # we store the per-sample version and let the actor handle CFG).
+        video_grid = (
+            self._get_mesh_id(
+                latents.shape[-3] // patch_size[0],
+                latents.shape[-2] // patch_size[1],
+                latents.shape[-1] // patch_size[2],
+                0,
+                1,
+                frame_st_id,
+            )
+            .to(latents.device)[None]
+            .repeat(batch_size, 1, 1)
+        )
+        action_grid = (
+            self._get_mesh_id(
+                init_actions.shape[-3],
+                init_actions.shape[-2],
+                init_actions.shape[-1],
+                1,
+                1,
+                frame_st_id,
+                action=True,
+            )
+            .to(latents.device)[None]
+            .repeat(batch_size, 1, 1)
+        )
+        text_emb = server.prompt_embeds.to(server.dtype)  # [B, L, D] (pos only)
+        meta = torch.tensor(
+            [
+                int(frame_st_id),
+                int(bool(server.use_cfg)),
+                int(server.job_config.attn_window),
+                int(server.job_config.frame_chunk_size),
+                int(server.action_per_frame),
+                int(latent_token_per_chunk),
+            ],
+            dtype=torch.long,
+        )
+        B = batch_size
+        cond = {
+            "cond_video_latents": latents.detach().cpu(),
+            "cond_text_emb": text_emb.detach().cpu(),
+            "cond_video_grid": video_grid.detach().cpu(),
+            "cond_action_grid": action_grid.detach().cpu(),
+            "cond_sigmas": sigmas.detach().cpu()[None].repeat(B, 1),
+            "cond_raw_timesteps": raw_timesteps.detach().cpu()[None].repeat(B, 1),
+            "cond_meta": meta[None].repeat(B, 1),
+        }
+        return {
+            "actions": actions_np,
+            "raw_actions": clean.detach().cpu(),
+            "chains": result["chains"].detach().cpu(),
+            "logprobs": result["logprobs"].detach().cpu(),
+            "denoise_index": result["denoise_index"],
+            "cond": cond,
+        }
+
     def infer_batch(
         self,
         obs_batch: list[dict[str, Any]],

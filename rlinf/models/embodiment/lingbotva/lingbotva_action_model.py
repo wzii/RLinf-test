@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.lingbotva import flow_rl as _flow_rl
 from rlinf.models.embodiment.lingbotva._utils import (
     extend_import_path,
     load_transformer_state_dict,
@@ -97,6 +98,34 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         self._episode_states: dict[int, LingbotVAEpisodeState] = {}
         self._ac_applied = False
 
+        # ---- Flow-matching RL (Flow-SDE / Flow-Noise) ----
+        # Resolved from cfg so the same model object can serve eval, SFT, and
+        # online RL. ``flow_ode`` (the default for non-RL paths) keeps
+        # predict_action_batch fully deterministic.
+        self.flow_rl_cfg = _flow_rl.FlowRLConfig(
+            noise_method=str(getattr(cfg, "noise_method", "flow_ode")),
+            noise_level=float(getattr(cfg, "noise_level", 0.7)),
+            joint_logprob=bool(getattr(cfg, "joint_logprob", False)),
+            ignore_last=bool(getattr(cfg, "ignore_last", False)),
+            safe_get_logprob=bool(getattr(cfg, "safe_get_logprob", False)),
+        )
+        self.noise_method = self.flow_rl_cfg.noise_method
+        self.add_value_head = bool(getattr(cfg, "add_value_head", False))
+
+        # Flow-Noise learnable noise network. Created unconditionally for
+        # flow_noise so it exists on both the rollout and actor workers and is
+        # picked up by the weight syncer.
+        self.noise_head: nn.Module | None = None
+        if self.noise_method == "flow_noise":
+            self.noise_head = _flow_rl.LearnableNoiseHead(action_dim=self.action_dim)
+
+        # Optional critic head on the (mean-pooled) clean action latent.
+        self.value_head: nn.Module | None = None
+        if self.add_value_head:
+            self.value_head = nn.Sequential(
+                nn.Linear(self.action_dim, 128), nn.SiLU(), nn.Linear(128, 1)
+            )
+
         if self.training_mode:
             self._load_transformer_for_training()
 
@@ -113,12 +142,8 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
             f"LingBot-VA does not support forward_type={forward_type}."
         )
 
-    def default_forward(self, **kwargs):
-        del kwargs
-        raise NotImplementedError(
-            "LingBot-VA default_forward is not supported. Use predict_action_batch "
-            "for eval or sft_forward for training."
-        )
+    # ``default_forward`` is defined near the end of the class -- it dispatches
+    # the flow-matching RL actor update (recompute log-prob / value / entropy).
 
     # ------------------------------------------------------------------
     # Training path
@@ -470,11 +495,13 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         )
 
     def predict_action_batch(
-        self, env_obs: dict[str, Any], mode: str = "eval", **_: Any
+        self, env_obs: dict[str, Any], mode: str = "eval", **kwargs: Any
     ):
+        if mode in ("train", "rollout"):
+            return self._predict_action_batch_rl(env_obs, **kwargs)
         if mode != "eval":
             raise NotImplementedError(
-                "LingBot-VA Libero adapter only supports eval mode."
+                "LingBot-VA Libero adapter supports eval / train (RL) modes only."
             )
         if self.training_mode:
             raise RuntimeError(
@@ -562,3 +589,286 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
             "forward_inputs": {"action": action_tensor},
         }
         return action_tensor, result
+
+    # ------------------------------------------------------------------
+    # Flow-matching RL: rollout (Flow-SDE / Flow-Noise)
+    # ------------------------------------------------------------------
+
+    def _noise_std_fn(self):
+        """Bound ``self.noise_head`` into the ``(x_t, sigma) -> std`` callable."""
+        if self.noise_head is None:
+            return None
+        return lambda x_t, sigma: self.noise_head(x_t, sigma)
+
+    @staticmethod
+    def _latent_logprob_to_steps(
+        lp_latent: torch.Tensor, num_exec: int, first_chunk: bool
+    ) -> torch.Tensor:
+        """Map a per-element latent log-prob to per-executed-step log-probs.
+
+        ``lp_latent`` is ``[B, action_dim, F, A, 1]`` (the Gaussian log-density
+        of the sampled action latent). Executable actions are the latent's
+        ``(F, A)`` grid flattened with the leading frame optionally dropped (see
+        :meth:`_select_executable_actions`). Summing over ``action_dim`` yields
+        the joint log-prob of each executed action step, shape ``[B, num_exec]``,
+        so it lines up element-wise with the executed action tensor used by GRPO.
+        """
+        lp = lp_latent.squeeze(-1).sum(dim=1)  # [B, F, A] (sum over action_dim)
+        start = 1 if first_chunk else 0
+        lp = lp[:, start:, :]
+        lp = lp.reshape(lp.shape[0], -1)  # [B, (F-start)*A]
+        return lp[:, :num_exec]
+
+    def _predict_action_batch_rl(self, env_obs: dict[str, Any], **_: Any):
+        """Online-RL rollout: stochastic flow denoising with log-probs.
+
+        Mirrors the eval path's I/O contract but returns *real* per-step
+        log-probs (and values) plus the ``forward_inputs`` the actor needs to
+        recompute them under gradient. Runs on the rollout worker, where the
+        eval backend (the frozen inference transformer) is available.
+        """
+        if self.training_mode:
+            raise RuntimeError(
+                "RL rollout uses the eval backend; do not call it with "
+                "training_mode=True (that path is the actor update)."
+            )
+        if self.noise_method == "flow_ode":
+            raise ValueError(
+                "predict_action_batch(mode='train') needs a stochastic "
+                "noise_method (flow_sde / flow_noise / flow_cps), got flow_ode."
+            )
+
+        states_tensor = env_obs.get("states")
+        if states_tensor is None:
+            raise ValueError("LingBot-VA RL rollout requires batched states.")
+        batch_size = states_tensor.shape[0]
+        backend = self._ensure_backend()
+
+        prompts: list[str] = []
+        obs_batch: list[dict[str, Any]] = []
+        for env_idx in range(batch_size):
+            prompt = self._get_prompt(env_obs, env_idx)
+            state = self._get_state(env_idx)
+            if state.prompt != prompt:
+                state.reset(prompt)
+            obs = LingbotVALiberoObservationAdapter.format_observation(
+                env_obs, env_idx, prompt
+            )
+            prompts.append(prompt)
+            obs_batch.append(obs)
+
+        rollout = backend.rl_rollout(
+            obs_batch,
+            prompts,
+            self.flow_rl_cfg,
+            noise_std_fn=self._noise_std_fn(),
+        )
+
+        # Build the executed action tensor (env-facing), exactly as eval does.
+        chunks: list[torch.Tensor] = []
+        for env_idx, raw_action in enumerate(rollout["actions"]):
+            env_actions = self._select_executable_actions(raw_action, first_chunk=True)
+            limit = min(self.exec_steps_per_chunk, env_actions.shape[0])
+            chunks.append(torch.from_numpy(env_actions[:limit]))
+            self._get_state(env_idx).first_chunk = False
+        common_len = min(c.shape[0] for c in chunks)
+        chunks = [c[:common_len] for c in chunks]
+        action_tensor = torch.stack(chunks, dim=0).to(dtype=torch.float32)
+
+        prev_logprobs = self._latent_logprob_to_steps(
+            rollout["logprobs"], common_len, first_chunk=True
+        )
+        if self.value_head is not None:
+            prev_values = self._value_from_latent(rollout["raw_actions"]).expand(
+                -1, common_len
+            )
+        else:
+            prev_values = torch.zeros_like(prev_logprobs)
+
+        # All forward_inputs values must be batch-leading tensors -- the rollout
+        # worker splits every entry with ``torch.split(value, sizes, dim=0)``.
+        # ``cond`` is already flattened into ``cond_*`` batch-leading tensors by
+        # the backend; per-sample scalars are broadcast to ``[B]``.
+        B = action_tensor.shape[0]
+        forward_inputs = {
+            "chains": rollout["chains"],
+            "denoise_index": torch.full((B,), int(rollout["denoise_index"])),
+            "exec_len": torch.full((B,), int(common_len)),
+            "first_chunk": torch.ones(B, dtype=torch.bool),
+        }
+        forward_inputs.update(rollout["cond"])
+        result = {
+            "prev_logprobs": prev_logprobs.to(torch.float32),
+            "prev_values": prev_values.to(torch.float32),
+            "forward_inputs": forward_inputs,
+        }
+        return action_tensor, result
+
+    # ------------------------------------------------------------------
+    # Flow-matching RL: actor update (recompute log-probs under gradient)
+    # ------------------------------------------------------------------
+
+    def _value_from_latent(self, raw_actions: torch.Tensor) -> torch.Tensor:
+        """Critic value from the mean-pooled clean action latent -> ``[B, 1]``."""
+        device = next(self.value_head.parameters()).device
+        pooled = (
+            raw_actions.to(device).squeeze(-1).mean(dim=(2, 3))
+        )  # [B, action_dim]
+        return self.value_head(pooled.to(self.torch_dtype)).to(torch.float32)
+
+    @staticmethod
+    def _unpack_meta(meta_row: torch.Tensor) -> dict[str, int]:
+        keys = [
+            "frame_st_id",
+            "use_cfg",
+            "attn_window",
+            "frame_chunk_size",
+            "action_per_frame",
+            "latent_token_per_chunk",
+        ]
+        return {k: int(meta_row[i].item()) for i, k in enumerate(keys)}
+
+    def _warm_video_cache(self, cond: dict[str, Any], meta: dict[str, int], device) -> None:
+        """Repopulate ``self.transformer``'s KV cache with the rollout's video
+        context so the action-stream recompute sees the same conditioning.
+
+        .. note::
+            This is the single ``wan_va``-coupled step of the recompute path and
+            must be validated on GPU with the real package. It mirrors the
+            (deterministic) final video forward of
+            :meth:`...native_backend.LingbotVALiberoBackend.rl_rollout`.
+        """
+        tfm = self.transformer
+        cache_name = "rlinf_rl_actor"
+        bsz = cond["cond_video_latents"].shape[0]
+        cfg_bsz = bsz * (2 if meta["use_cfg"] else 1)
+        try:
+            tfm.clear_cache(cache_name)
+        except Exception:
+            pass
+        tfm.create_empty_cache(
+            cache_name,
+            meta["attn_window"],
+            meta["latent_token_per_chunk"],
+            meta["frame_chunk_size"] * meta["action_per_frame"],
+            dtype=self.torch_dtype,
+            device=device,
+            batch_size=cfg_bsz,
+        )
+        latents = cond["cond_video_latents"].to(device).to(self.torch_dtype)
+        grid = cond["cond_video_grid"].to(device)
+        text = cond["cond_text_emb"].to(device).to(self.torch_dtype)
+        timesteps = torch.zeros(
+            (bsz, latents.shape[2]), device=device, dtype=torch.float32
+        )
+        if meta["use_cfg"]:
+            latents = latents.repeat(2, 1, 1, 1, 1)
+            grid = grid.repeat(2, 1, 1)
+            text = text.repeat(2, 1, 1)
+            timesteps = timesteps.repeat(2, 1)
+        video_in = {
+            "noisy_latents": latents,
+            "timesteps": timesteps,
+            "grid_id": grid,
+            "text_emb": text,
+        }
+        tfm(video_in, update_cache=1, cache_name=cache_name, action_mode=False)
+        self._rl_cache_name = cache_name
+
+    def _recompute_action_velocity(
+        self, x_t: torch.Tensor, raw_t, cond: dict[str, Any],
+        meta: dict[str, int], device,
+    ) -> torch.Tensor:
+        """Velocity of the action stream under ``self.transformer`` (with grad).
+
+        ``raw_t`` is the scheduler-native timestep: a float (shared step) or a
+        per-sample ``[B]`` tensor (mixed micro-batch).
+        """
+        bsz = x_t.shape[0]
+        n_tok = meta["frame_chunk_size"] * meta["action_per_frame"]
+        noisy = x_t.to(self.torch_dtype)
+        grid = cond["cond_action_grid"].to(device)
+        text = cond["cond_text_emb"].to(self.torch_dtype).to(device)
+        if torch.is_tensor(raw_t) and raw_t.dim() > 0:
+            timesteps = raw_t.to(device, torch.float32).flatten()[:, None].expand(bsz, n_tok)
+        else:
+            val = float(raw_t) if not torch.is_tensor(raw_t) else float(raw_t.item())
+            timesteps = torch.full((bsz, n_tok), val, device=device, dtype=torch.float32)
+        if meta["use_cfg"]:
+            noisy = noisy.repeat(2, 1, 1, 1, 1)
+            grid = grid.repeat(2, 1, 1)
+            text = text.repeat(2, 1, 1)
+            timesteps = timesteps.repeat(2, 1)
+        action_in = {
+            "noisy_latents": noisy,
+            "timesteps": timesteps,
+            "grid_id": grid,
+            "text_emb": text,
+        }
+        out = self.transformer(
+            action_in,
+            update_cache=0,
+            cache_name=getattr(self, "_rl_cache_name", "rlinf_rl_actor"),
+            action_mode=True,
+        )
+        # Reshape [B*, (F*A), C] -> [B, action_dim, F, A, 1] + CFG combine.
+        out = (
+            out.unflatten(1, (meta["frame_chunk_size"], meta["action_per_frame"]))
+            .permute(0, 3, 1, 2)
+            .unsqueeze(-1)
+        )
+        out = out[:bsz]
+        return out.to(torch.float32)
+
+    def default_forward(self, forward_inputs=None, **kwargs):  # type: ignore[override]
+        """Actor update: recompute log-prob / value / entropy for GRPO.
+
+        When called with RL ``forward_inputs`` (containing ``chains``) this runs
+        the flow-RL recompute; otherwise it falls back to the original
+        not-supported behaviour.
+        """
+        if forward_inputs is None or "chains" not in forward_inputs:
+            raise NotImplementedError(
+                "LingBot-VA default_forward needs RL forward_inputs with 'chains'."
+            )
+        device = next(self.transformer.parameters()).device
+        chains = forward_inputs["chains"].to(device)
+        denoise_index = forward_inputs["denoise_index"]
+        first_chunk = bool(forward_inputs["first_chunk"].flatten()[0].item())
+        exec_len = int(forward_inputs["exec_len"].flatten()[0].item())
+        meta = self._unpack_meta(forward_inputs["cond_meta"][0])
+        # Per-sample schedules are identical within a micro-batch; take row 0.
+        sigmas = forward_inputs["cond_sigmas"][0].to(device)
+        raw_timesteps = forward_inputs["cond_raw_timesteps"][0].to(device)
+        cond = {
+            k: v for k, v in forward_inputs.items() if k.startswith("cond_")
+        }
+
+        # Warm the KV cache once with the (fixed) video context, then recompute.
+        self._warm_video_cache(cond, meta, device)
+
+        logprobs, entropy = _flow_rl.recompute_logprob_entropy(
+            chains,
+            sigmas,
+            denoise_index,
+            velocity_fn=lambda x, t: self._recompute_action_velocity(
+                x, t, cond, meta, device
+            ),
+            cfg=self.flow_rl_cfg,
+            noise_std_fn=self._noise_std_fn(),
+            cond_times=raw_timesteps,
+        )
+
+        lp = self._latent_logprob_to_steps(logprobs, exec_len, first_chunk)
+        ent = self._latent_logprob_to_steps(entropy, exec_len, first_chunk)
+        if self.value_head is not None:
+            x0 = chains[:, -1]
+            values = self._value_from_latent(x0).expand(-1, exec_len)
+        else:
+            values = torch.zeros_like(lp)
+
+        return {
+            "logprobs": lp.to(torch.float32),
+            "values": values.to(torch.float32),
+            "entropy": ent.to(torch.float32),
+        }
