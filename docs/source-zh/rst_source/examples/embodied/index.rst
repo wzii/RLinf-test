@@ -506,6 +506,7 @@
    pi0
    gr00t
    lingbotvla
+   grpo_lingbotva
    dexbotic
    starvla
    mlp

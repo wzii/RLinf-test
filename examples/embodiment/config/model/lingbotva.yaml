@@ -9,8 +9,8 @@ lora_path: null
 
 # ---- Flow-matching RL (Flow-SDE / Flow-Noise) ----
 # Default is the deterministic ODE so eval / SFT are unchanged. Online-RL
-# configs override noise_method to flow_sde / flow_noise / flow_cps.
-noise_method: flow_ode      # flow_ode | flow_sde | flow_noise | flow_cps
+# configs override noise_method to flow_sde / flow_noise.
+noise_method: flow_ode      # flow_ode | flow_sde | flow_noise
 noise_level: 0.7            # SDE diffusion scale / CPS rotation angle
 joint_logprob: false        # log-prob over all denoise steps vs a single step
 ignore_last: false          # never sample the terminal (sigma->0) step

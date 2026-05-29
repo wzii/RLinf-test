@@ -12,56 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Flow-matching RL (Flow-SDE / Flow-Noise / Flow-CPS) for LingBot-VA.
+"""Flow-matching RL (Flow-SDE / Flow-Noise) for LingBot-VA.
 
-This module ports RLinf's flow-matching RL machinery -- already used for the
-``openpi`` (:math:`\\pi_0` / :math:`\\pi_{0.5}`) and ``lingbotvla`` action
-experts (see :mod:`rlinf.models.embodiment.openpi.openpi_action_model` and
-:mod:`rlinf.models.embodiment.lingbotvla.lingbotvla_action_model`) -- onto the
-**action stream** of the LingBot-VA video-diffusion transformer (Wan 2.2).
+Ports RLinf's flow-matching RL math (used for ``openpi`` / ``lingbotvla``) onto
+the action stream of the LingBot-VA Wan 2.2 video-diffusion transformer.
 
-Why this layer exists
----------------------
-LingBot-VA generates actions by iteratively denoising an action latent with a
-flow-matching ODE (``action_scheduler.step`` Euler updates in
-:meth:`rlinf.models.embodiment.lingbotva.eval_adapter.native_backend.LingbotVALiberoBackend._infer_batch_impl`).
-A deterministic ODE has an intractable per-action log-likelihood, so it cannot
-be trained with policy-gradient RL directly. RLinf solves this two ways:
+LingBot-VA denoises actions with a flow-matching ODE whose per-action
+log-likelihood is intractable, so policy-gradient RL needs the multi-step
+denoiser turned into Gaussian transitions:
 
-* **Flow-SDE** -- convert the denoising ODE into an equivalent SDE so each
-  denoise step becomes a Gaussian transition with a closed-form log-prob.
-  Exploration noise is injected by the SDE diffusion term.
-* **Flow-Noise** -- keep the ODE mean but add a *learnable* per-step Gaussian
-  noise head, modelling denoising as a discrete-time MDP with an exact
-  log-prob.
+* **Flow-SDE** -- convert the ODE into an equivalent SDE; each step is a
+  Gaussian transition with a closed-form log-prob and SDE exploration noise.
+* **Flow-Noise** -- keep the ODE mean, add a learnable Gaussian noise head.
 
-Both make the multi-step denoiser a sequence of Gaussian transitions that GRPO
-/ PPO can optimise, exactly as in the ``lingbotvla`` implementation.
-
-Sigma / velocity convention
----------------------------
-The Wan 2.2 ``FlowMatchScheduler`` (DiffSynth-derived) parameterises the
-forward process as ``x_sigma = (1 - sigma) * x0 + sigma * x1`` with
-``x1 ~ N(0, I)`` (pure noise at ``sigma = 1``, clean action at ``sigma = 0``)
-and predicts the velocity ``v = x1 - x0 = d x_sigma / d sigma``. This is the
-*same* convention RLinf's other action experts use, with the continuous time
-``t`` replaced by the scheduler's ``sigma``. Concretely::
-
-    x0_pred = x_t - sigma * v
-    x1_pred = x_t + (1 - sigma) * v
-
-and a single deterministic Euler step to the next sigma reproduces
-``action_scheduler.step`` exactly::
-
-    x_next = x0_pred * (1 - sigma_next) + x1_pred * sigma_next = x_t - v * delta
-
-where ``delta = sigma - sigma_next``. The SDE / Noise variants only change the
-``x1_pred`` weight and the std of the transition (see
+Wan's ``FlowMatchScheduler`` uses ``x_sigma = (1 - sigma) * x0 + sigma * x1``
+(``x1 ~ N(0, I)``) and predicts ``v = x1 - x0``, i.e. RLinf's usual convention
+with ``t`` replaced by ``sigma``, so ``x0_pred = x_t - sigma * v`` and a
+deterministic Euler step reproduces ``action_scheduler.step`` (see
 :func:`sample_mean_var_val`).
 
-The functions here are deliberately free of any Wan / GPU dependency -- they
-operate on plain tensors and a ``velocity_fn`` callable -- so the core math is
-unit-testable on CPU (see ``tests/unit_tests/test_lingbotva_flow_rl.py``).
+These helpers take plain tensors + a ``velocity_fn`` callable (no Wan / GPU
+dependency), so the math is unit-tested on CPU.
 """
 
 from __future__ import annotations
@@ -90,7 +61,7 @@ class FlowRLConfig:
     model can build it once and hand it around.
     """
 
-    noise_method: str = "flow_sde"  # flow_ode | flow_sde | flow_noise | flow_cps
+    noise_method: str = "flow_sde"  # flow_ode | flow_sde | flow_noise
     noise_level: float = 0.7
     joint_logprob: bool = False  # log-prob over *all* steps (Flow-Noise style)
     ignore_last: bool = False  # never sample the final (sigma->0) step
@@ -265,14 +236,6 @@ def sample_mean_var_val(
         x1_w = ode_x1_w - (sigma_i**2) * delta / (2.0 * s_clamp)
         std = torch.sqrt(torch.clamp(delta, min=0.0)) * sigma_i
         std = std.expand_as(x_t)
-    elif cfg.noise_method == "flow_cps":
-        # Coefficients-preserving sampling (arXiv:2509.05952): rotate the noise
-        # weight by ``pi * noise_level / 2`` instead of rescaling it.
-        cos_term = math.cos(math.pi * cfg.noise_level / 2.0)
-        sin_term = math.sin(math.pi * cfg.noise_level / 2.0)
-        x0_w = ode_x0_w
-        x1_w = ode_x1_w * cos_term
-        std = (ode_x1_w * sin_term).expand_as(x_t)
     elif cfg.noise_method == "flow_noise":
         # Learnable Gaussian noise head; ODE mean is preserved.
         if noise_std is None:

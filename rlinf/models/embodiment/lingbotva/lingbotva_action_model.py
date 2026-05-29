@@ -635,7 +635,7 @@ class LingbotVAActionModel(nn.Module, BasePolicy):
         if self.noise_method == "flow_ode":
             raise ValueError(
                 "predict_action_batch(mode='train') needs a stochastic "
-                "noise_method (flow_sde / flow_noise / flow_cps), got flow_ode."
+                "noise_method (flow_sde / flow_noise), got flow_ode."
             )
 
         states_tensor = env_obs.get("states")

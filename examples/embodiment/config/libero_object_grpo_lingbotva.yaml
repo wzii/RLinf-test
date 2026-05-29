@@ -1,18 +1,6 @@
-# Online RL (GRPO) fine-tuning of LingBot-VA on LIBERO-Object with RLinf's
-# flow-matching RL (Flow-SDE / Flow-Noise).
-#
-# This builds on the LingBot-VA SFT + eval integration (PR #1220) and reuses
-# RLinf's flow-RL machinery (already used for openpi / lingbotvla). The action
-# stream of the Wan 2.2 video-diffusion transformer is denoised as a Flow-SDE
-# (default) or Flow-Noise MDP so GRPO can optimise it.
-#
-# Switch algorithms with a CLI override, e.g.:
-#   bash examples/embodiment/run_embodiment.sh libero_object_grpo_lingbotva \
-#       actor.model.noise_method=flow_noise
-#
-# NOTE: the flow-RL *math* is unit-tested (tests/unit_tests/test_lingbotva_flow_rl.py);
-# the Wan-transformer rollout/recompute plumbing requires GPU + the real
-# wan_va package and an SFT checkpoint to validate end-to-end.
+# GRPO fine-tuning of LingBot-VA on LIBERO-Object with RLinf flow-matching RL
+# (Flow-SDE default / Flow-Noise). See docs grpo_lingbotva.rst. Switch algo via
+# `actor.model.noise_method=flow_noise rollout.model.noise_method=flow_noise`.
 
 defaults:
   - env/libero_object@env.train
@@ -165,7 +153,7 @@ actor:
     action_dim: 7
 
     # ---- flow-matching RL ----
-    noise_method: flow_sde   # flow_sde (default) | flow_noise | flow_cps
+    noise_method: flow_sde   # flow_sde (default) | flow_noise
     noise_level: 0.7
     joint_logprob: False
     add_value_head: False

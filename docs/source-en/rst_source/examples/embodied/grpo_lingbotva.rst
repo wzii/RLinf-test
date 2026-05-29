@@ -87,8 +87,8 @@ Key knobs (under ``actor.model``):
 
 .. code:: yaml
 
-   noise_method: flow_sde   # flow_sde | flow_noise | flow_cps
-   noise_level: 0.7         # SDE diffusion scale (or CPS rotation angle)
+   noise_method: flow_sde   # flow_sde | flow_noise
+   noise_level: 0.7         # SDE diffusion scale
    joint_logprob: False     # single-step (default) vs all-step log-prob
    add_value_head: False    # GRPO is critic-free
    lingbotva:
@@ -111,7 +111,7 @@ Verification status
 
 - **Flow-RL core math** — unit-tested in
   ``tests/unit_tests/test_lingbotva_flow_rl.py`` (Flow-SDE / Flow-Noise /
-  Flow-CPS / Flow-ODE transitions, Gaussian log-prob vs ``torch.distributions``,
+  Flow-ODE transitions, Gaussian log-prob vs ``torch.distributions``,
   the ODE limit as ``noise_level → 0``, the learnable noise head, and — most
   importantly — rollout/recompute log-prob consistency). These run on a bare
   CPU ``torch`` install.
