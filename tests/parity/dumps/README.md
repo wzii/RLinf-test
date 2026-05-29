@@ -1,32 +1,39 @@
 # Parity msprobe dumps
 
 Per-API statistics dumps produced by [MindStudio Probe](https://gitee.com/ascend/mstt/tree/master/debug/accuracy_tools/msprobe)
-(`pip install mindstudio-probe`, version 26.0.0). One step per worker = one
-call to `MultiStepRolloutWorker.predict()` on a deterministic, single-env
-LIBERO-Spatial eval.
+(`pip install mindstudio-probe`, version 26.0.0).
 
-## Capture conditions
+## How these were captured
 
-Reproducible via `tests/parity/eval_libero_npu_fp32.sh` with the
-`tests/parity/configs/libero_spatial_openvlaoft_eval.yaml` config, which forces:
+Via `tests/parity/openvla_oft/run_rlinf_msprobe.py` — the parity-path
+runner that loads OpenVLA-OFT directly and forwards a **fixed, golden,
+byte-identical input batch** (the same 32 samples used by
+`run_rlinf.py`, loaded from the Wan checkpoint's bundled `.npy` files).
 
-- `eval_rollout_epoch=1`, `env.eval.max_steps_per_rollout_epoch=8`
-  (= `num_action_chunks` ⇒ `n_eval_chunk_steps=1`),
-  `rollout.pipeline_stage_num=1`, `env.eval.total_num_envs=1`
-  → exactly one `predict()` per process → one msprobe `step0` directory
-- `temperature_eval=0` ⇒ `do_sample=False` inside
-  `huggingface_worker.setup_sample_params` ⇒ argmax decode, no `multinomial`
-- `seed_all(seed=1234, mode=True)` at module import of
-  `huggingface_worker.py` ⇒ `torch.use_deterministic_algorithms(True)`
-- `CUBLAS_WORKSPACE_CONFIG=:4096:8` (required by cuBLAS determinism)
-- `env.eval.use_fixed_reset_state_ids=True` + `use_ordered_reset_state_ids=True`
-  ⇒ env reset state determined by task config
-- `enable_cuda_graph=False`, `enable_torch_compile=False`
-- `MUJOCO_GL=egl` on this GPU host (this `gpu/` capture). For NPU hosts use
-  `osmesa`; **the rendered image bytes differ between EGL and OSMesa, so a
-  byte-level GPU↔NPU comparison requires both hosts to use the same renderer
-  (or to bypass the env entirely via `tests/parity/openvla_oft/run_rlinf.py`
-  with a golden input).**
+**No LIBERO env, no MuJoCo, no Ray, no rendering.** That removes the
+biggest cross-architecture noise sources (EGL vs OSMesa, x86 vs aarch64
+FPU on physics) before they can pollute downstream per-API statistics.
+
+Each run splits the 32 samples into **4 chunks of 8** and wraps each
+chunk in its own `debugger.start / stop / step`, so the dump contains
+**4 msprobe steps** per run. Four steps with the same shape but different
+data is the right granularity for catching shape-dependent kernel
+divergences (more than one step's worth of evidence, not so many that
+the dump becomes unwieldy).
+
+## Determinism knobs
+
+- `do_sample=False`, `temperature=1.0` (ignored) ⇒ argmax decode, no
+  `multinomial` RNG inside `predict_action_batch`
+- `set_determinism(seed=1234)` pins torch / NumPy / random / cudnn /
+  CUBLAS_WORKSPACE_CONFIG / ACLNN_DETERMINISTIC
+- `attn_implementation="sdpa"` (knob: `--attn-implementation`) so the
+  no-patch run goes through `F.scaled_dot_product_attention`, which is
+  what NPU's `torch_npu` PrivateUse1 SDPA registration also intercepts
+- bf16/fp32 patches use `tests/parity/fp32_attn_loader.py` with
+  `PARITY_ATTN_DTYPE=bf16` (or `fp32`) — replaces `LlamaSdpaAttention.forward`
+  with a manual `matmul → softmax → matmul` decomposition at the chosen
+  compute dtype
 
 ## Layout
 
@@ -34,32 +41,54 @@ Reproducible via `tests/parity/eval_libero_npu_fp32.sh` with the
 dumps/
 └── gpu/                                       # NVIDIA A100 80GB SXM4
     ├── no_patch/                              # PARITY_DISABLE_FP32_ATTN=1
-    │   └── step0/rank0/
-    │       ├── construct.json                 # module/op tree
-    │       ├── dump.json                      # per-API stats (mean/max/min/L2/…)
-    │       └── stack.json                     # Python call stack per op
+    │   ├── step0/proc<PID>/{construct,dump,stack}.json   # samples 0-7
+    │   ├── step1/proc<PID>/{construct,dump,stack}.json   # samples 8-15
+    │   ├── step2/proc<PID>/{construct,dump,stack}.json   # samples 16-23
+    │   └── step3/proc<PID>/{construct,dump,stack}.json   # samples 24-31
     └── bf16_patch/                            # PARITY_ATTN_DTYPE=bf16
-        └── step0/rank0/                       # same files; the SDPA path is
-                                               # decomposed by `fp32_attn_loader`
-                                               # into matmul→softmax→matmul,
-                                               # all in bf16 -- so this dump
-                                               # captures the *manual* attention
-                                               # ops one-by-one rather than a
-                                               # single fused `scaled_dot_product_attention`.
+        ├── step0/proc<PID>/{construct,dump,stack}.json
+        ├── step1/proc<PID>/{construct,dump,stack}.json
+        ├── step2/proc<PID>/{construct,dump,stack}.json
+        └── step3/proc<PID>/{construct,dump,stack}.json
 ```
 
-`construct.json` describes the module call tree; `dump.json` contains
-per-op input/output statistics; `stack.json` records the originating Python
-frames. `msprobe compare` consumes the pair of `dump.json`s.
+`construct.json` = module/op call tree; `dump.json` = per-API
+input/output statistics (mean/max/min/L2/norm/…); `stack.json` = the
+originating Python frames. Compare two runs with `msprobe compare` (one
+pair per matching `stepN`).
 
-## Notes
+The `proc<PID>` rank-equivalent directory is msprobe's per-process
+namespace; for single-process scripts there's exactly one. (Worker-mode
+dumps use `rank<N>` instead.)
 
-- `eval/num_trajectories: 0` in the log is **expected**: with
-  `max_steps_per_rollout_epoch=8` only one chunk action runs before the
-  rollout epoch ends, so no LIBERO episode finishes and no `success_once`
-  is recorded. This is the price of restricting to a single deterministic
-  dump step; switching `max_steps_per_rollout_epoch` back to 512 would
-  produce 64 dump steps per epoch *and* real `success_once`.
-- The two GPU runs above used the same EGL renderer, same checkpoint, same
-  seed; differences between them isolate the **attention math** (cuDNN
-  flash/efficient vs. manual decomposed bf16).
+## What's *not* here (yet)
+
+- **NPU dumps.** Run the same script on the NPU host:
+
+      python tests/parity/openvla_oft/run_rlinf_msprobe.py \
+          --mode no_patch \
+          --dump-path tests/parity/dumps/npu/no_patch
+      python tests/parity/openvla_oft/run_rlinf_msprobe.py \
+          --mode bf16_patch \
+          --dump-path tests/parity/dumps/npu/bf16_patch
+
+  Then `msprobe compare tests/parity/dumps/gpu/no_patch/step0/proc*/dump.json
+  tests/parity/dumps/npu/no_patch/step0/proc*/dump.json` (per step).
+
+- **`fp32_patch` dumps.** The runner supports `--mode fp32_patch`; we
+  haven't shipped a default capture for it yet — add when needed.
+
+## Reproducing
+
+```bash
+# from the repo root, using the openvlaoft_libero_venv venv
+PYTHONPATH=. /workspace/RLinf/openvlaoft_libero_venv/bin/python \
+    tests/parity/openvla_oft/run_rlinf_msprobe.py \
+    --mode no_patch \
+    --dump-path tests/parity/dumps/gpu/no_patch
+
+PYTHONPATH=. /workspace/RLinf/openvlaoft_libero_venv/bin/python \
+    tests/parity/openvla_oft/run_rlinf_msprobe.py \
+    --mode bf16_patch \
+    --dump-path tests/parity/dumps/gpu/bf16_patch
+```
