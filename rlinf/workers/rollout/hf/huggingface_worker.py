@@ -457,10 +457,23 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
-        debugger = PrecisionDebugger(
-            task='statistics',
-            dump_path=os.environ.get('MSPROBE_DUMP_PATH', '/workspace/dump/'),
-        )
+
+        # msprobe per-API dump configuration
+        #   MSPROBE_DISABLE=1     -> no debugger created, no dump (default OFF here)
+        #   MSPROBE_MAX_STEPS=N   -> dump only the first N predict() calls (default 0 = no cap)
+        #   MSPROBE_DUMP_PATH=... -> where dumps go (default /workspace/dump/)
+        # The cap is what makes standard eval (50 epochs * 64 chunks) viable
+        # with dump on: full rollout runs to give success_once, but only the
+        # first N chunks pay the msprobe hook cost and write to disk.
+        msprobe_disabled = os.environ.get('MSPROBE_DISABLE', '0') == '1'
+        max_dump_steps = int(os.environ.get('MSPROBE_MAX_STEPS', '0'))
+        debugger = None
+        if not msprobe_disabled:
+            debugger = PrecisionDebugger(
+                task='statistics',
+                dump_path=os.environ.get('MSPROBE_DUMP_PATH', '/workspace/dump/'),
+            )
+        dump_step = 0
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
@@ -469,11 +482,18 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    debugger.start(model=self.hf_model)
+                    should_dump = (
+                        debugger is not None
+                        and (max_dump_steps == 0 or dump_step < max_dump_steps)
+                    )
+                    if should_dump:
+                        debugger.start(model=self.hf_model)
                     actions, _ = self.predict(env_output["obs"], mode="eval")
-                    debugger.stop()
+                    if should_dump:
+                        debugger.stop()
+                        debugger.step()
+                        dump_step += 1
                     self.send_chunk_actions(output_channel, actions, mode="eval")
-                    debugger.step()
 
         if self.enable_offload:
             self.offload_model()

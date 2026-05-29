@@ -61,6 +61,53 @@ The `proc<PID>` rank-equivalent directory is msprobe's per-process
 namespace; for single-process scripts there's exactly one. (Worker-mode
 dumps use `rank<N>` instead.)
 
+## Companion: SR-confidence + dump (`gpu_eval_sr/`)
+
+The parity-path dump above is the cleanest cross-host kernel comparison
+we can make, but it gives **no `success_once`** because there's no env
+in the loop. To answer "does this model actually work?" alongside the
+dump, `gpu_eval_sr/` holds dumps from a *standard* LIBERO-Spatial eval
+(env in the loop, full 512-step episodes, 10 task combos) with the
+first **4 predict() calls** captured by msprobe.
+
+Mechanism: `MultiStepRolloutWorker.evaluate` honours
+``MSPROBE_MAX_STEPS`` -- when set to N>0 it dumps the first N chunk
+predicts and skips the rest, so a 10-epoch eval still runs to
+completion and produces real metrics.
+
+| run | success_once | success_at_end | trajectories | wall time |
+|---|---|---|---|---|
+| `gpu_eval_sr/no_patch`   | **0.60** | 0.30 | 10 | ~5m 10s |
+| `gpu_eval_sr/bf16_patch` | **0.80** | 0.40 | 10 | ~5m 21s |
+
+Caveats relative to the parity-path dump:
+
+- Inputs are *not* byte-identical across hosts (MuJoCo render, FPU drift on
+  physics) -- per-API cross-host stat diff includes env noise on top of
+  kernel noise.
+- The two GPU runs above use the same EGL renderer + same seed, so the
+  *same-host* no_patch ↔ bf16_patch comparison is clean and isolates the
+  attention math change.
+- N=10 trajectories has high variance -- the bf16-patch SR (0.80) being
+  above no_patch SR (0.60) on 10 samples is well within noise; the
+  important signal is "both are well above zero, the model is functioning".
+
+Reproduce:
+
+```bash
+MSPROBE_MAX_STEPS=4 \
+MSPROBE_DUMP_PATH=/workspace/dump/gpu_eval_sr_nopatch/ \
+PARITY_DISABLE_FP32_ATTN=1 \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+bash tests/parity/eval_libero_npu_fp32.sh libero_spatial_openvlaoft_eval -- \
+    algorithm.eval_rollout_epoch=10 \
+    env.eval.max_steps_per_rollout_epoch=512
+```
+
+(Swap `PARITY_DISABLE_FP32_ATTN=1` for `PARITY_ATTN_DTYPE=bf16` to run
+the patched arm.)
+
 ## What's *not* here (yet)
 
 - **NPU dumps.** Run the same script on the NPU host:
