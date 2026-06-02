@@ -122,6 +122,8 @@ class WanEnv(BaseWorldEnv):
         )
 
     def _build_pipeline(self):
+        # Install the NPU attention/rope/norm patches before the DiT is built.
+        self._install_attention_parity()
         pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device=self._get_runtime_device_str(),
@@ -135,6 +137,61 @@ class WanEnv(BaseWorldEnv):
         pipe.dit.to(self.device)
         pipe.vae.to(self.device)
         return pipe
+
+    def _install_attention_parity(self):
+        """On Ascend NPU, swap diffsynth's Wan DiT attention / rope / RMS norm.
+
+        diffsynth-studio's Wan DiT dispatches three primitives -- ``flash_attention``,
+        ``rope_apply`` and ``RMSNorm`` -- to vendor-specific kernels. The NPU
+        variants (mindiesd / torch_npu) differ numerically from the GPU kernels,
+        so on NPU we swap in the diffsynth-studio fork's versions through the
+        shared Patcher (the dreamzero / gr00t convention) before the DiT is built.
+        The replacements keep the original torch implementations on GPU, so GPU
+        behaviour is identical to upstream diffsynth. Auto-enabled on NPU; set
+        ``attn_parity: true/false`` in config to force the decision.
+        """
+        import logging
+
+        override = self.cfg.get("attn_parity", None)
+        if override is not None:
+            enabled = bool(override)
+        else:
+            enabled = self.device.type == "npu"
+        if not enabled:
+            return
+
+        logger = logging.getLogger(__name__)
+        try:
+            import diffsynth.models.wan_video_dit as wan_dit
+        except Exception as exc:
+            logger.warning(
+                "attn_parity: cannot import diffsynth wan_video_dit (%s); "
+                "Wan NPU patches not applied",
+                exc,
+            )
+            return
+
+        targets = ("flash_attention", "rope_apply", "RMSNorm")
+        missing = [name for name in targets if not hasattr(wan_dit, name)]
+        if missing:
+            logger.warning(
+                "attn_parity: diffsynth wan_video_dit is missing %s; "
+                "Wan NPU patches not applied",
+                missing,
+            )
+            return
+
+        from rlinf.utils.patcher import Patcher
+
+        base = "rlinf.envs.world_model.patch.wan_video_dit"
+        Patcher.clear()
+        for name in targets:
+            Patcher.add_patch(
+                f"diffsynth.models.wan_video_dit.{name}",
+                f"{base}.{name}",
+            )
+        Patcher.apply()
+        logger.info("attn_parity: Wan DiT %s patched for NPU", ", ".join(targets))
 
     def _load_reward_model(self):
         if self.cfg.reward_model.type == "ResnetRewModel":
